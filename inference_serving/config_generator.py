@@ -11,10 +11,13 @@ yaml.add_representer(FlowStyleList, represent_flowstyle_list)
 
 # generates topology according to the input arguments
 def createNetworkConfig(astra_sim, npu_nums, npu_group, link_bw, link_latency):
-
+    
     network_dim = int(math.log2(npu_group))+1
+    if npu_nums == npu_group:
+        # full pipeline parallelism, one dimension is sufficient
+        network_dim = 1
     output_file = astra_sim+f'/inputs/network/network.yml'
-    npus_per_dim = npu_nums//network_dim 
+    npus_per_dim = npu_nums//(2**(network_dim-1)) 
 
     topology_data = {
         "topology": FlowStyleList(["FullyConnected"] * network_dim),
