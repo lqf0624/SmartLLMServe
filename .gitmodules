@@ -2,3 +2,6 @@
 	path = astra-sim
 	url = https://github.com/casys-kaist/astra-sim.git
 	branch = v0.2.0
+[submodule "llm-profile"]
+	path = llm-profile
+	url = https://github.com/casys-kaist/llm-profile.git
