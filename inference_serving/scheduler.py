@@ -9,6 +9,7 @@ from .memory_model import *
 from .generate_graph import *
 from .generate_trace import *
 from .pim import *
+from .data_loader import create_data_loader
 
 # class that shedules request of astra-sim
 class Scheduler:
@@ -30,25 +31,50 @@ class Scheduler:
         # memory model
         self.memory = MemoryModel(model, npu_num, npu_mem, block_size, fp, verbose)
 
+        # universal data loader
+        self.data_loader = create_data_loader(verbose)
+
         # verbose
         self.verbose = verbose
 
-    # generate request in poisson dist
+    # generate request from dataset
     def generate(self, path, is_init=True):
         path = f'../{path}' # move out from astra-sim folder
-        data = pd.read_csv(path, sep='\t')
+
+        # Use universal data loader
+        try:
+            data = self.data_loader.load_dataset(path, self.req_num)
+        except Exception as e:
+            print(f"Scheduler: Error loading dataset {path}: {e}")
+            return
+
         cnt = 0
         for index, row in data.iterrows():
             if index >= self.req_num:
                 break
+
             input_length = int(row['input_toks'])
             output_length = int(row['input_toks'] + row['output_toks'])
             arrival_time_ns = int(row['arrival_time_ns'])
-            
-            self.add_request([self.model, input_length, output_length, arrival_time_ns], is_init=is_init)
-            cnt+=1
+
+            # Add additional metadata if available
+            request_data = [self.model, input_length, output_length, arrival_time_ns]
+
+            self.add_request(request_data, is_init=is_init)
+            cnt += 1
+
         if self.verbose:
-            print(f"Scheduler: added {cnt} requests to LLMServingSim")
+            print(f"Scheduler: added {cnt} requests to LLMServingSim from {path}")
+
+            # Show dataset statistics if available
+            if 'model_type' in data.columns:
+                model_dist = data['model_type'].value_counts()
+                print(f"Scheduler: Model distribution: {dict(model_dist)}")
+
+            if 'burst_pattern' in data.columns:
+                burst_dist = data['burst_pattern'].value_counts()
+                print(f"Scheduler: Burst pattern distribution: {dict(burst_dist)}")
+
         return
 
     # batch the request scheduling method
