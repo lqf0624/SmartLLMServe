@@ -19,7 +19,15 @@ SmartLLMServe builds upon the excellent [LLMServingSim](https://github.com/casys
 
 **Based on**: LLMServingSim v0.2.1 (MIT License)
 **Enhancement Target**: v0.3.0 - Predictive Scheduling Framework
-**Development Phase**: Active Development
+**Development Phase**: Phase 2/4 - Workload Prediction Module
+
+### ✅ **Completed Features (v0.3.0a)**
+- **Universal Data Loader**: Multi-format dataset support (TSV/CSV)
+- **BurstGPT Integration**: Real-world workload patterns
+- **Pattern Detection**: Automatic burst/steady/sparse classification
+- **Comprehensive Testing**: Full test coverage in `test/` directory
+
+### 🚧 **Next Phase**: Time Series Prediction Module (v0.3.1)
 
 ## 🏗️ Architecture Overview
 
@@ -44,12 +52,13 @@ SmartLLMServe builds upon the excellent [LLMServingSim](https://github.com/casys
 
 ## 🚀 Development Roadmap
 
-### Phase 1: Enhanced Data Infrastructure (v0.3.0)
-- [ ] **Universal Data Loader**
-  - [ ] Support for multiple dataset formats (TSV, CSV)
-  - [ ] BurstGPT dataset integration
-  - [ ] Automatic format detection and normalization
-  - [ ] Burst pattern detection algorithms
+### Phase 1: Enhanced Data Infrastructure (v0.3.0) ✅ **COMPLETED**
+- [x] **Universal Data Loader**
+  - [x] Support for multiple dataset formats (TSV, CSV)
+  - [x] BurstGPT dataset integration
+  - [x] Automatic format detection and normalization
+  - [x] Burst pattern detection algorithms
+  - [x] Comprehensive test coverage
 
 - [ ] **Feature Engineering Pipeline**
   - [ ] Time series feature extraction
@@ -155,18 +164,34 @@ cd ../../..
 
 ### Running Experiments
 ```bash
-# Original scheduling (baseline)
+# Original scheduling with TSV dataset (baseline)
 python main.py --model_name 'meta-llama/Llama-3.1-8B-Instruct' \
                --hardware 'RTX3090' --npu_num 1 --npu_group 1 \
                --dataset 'dataset/share-gpt-req100-rate10.tsv' \
-               --output 'output/baseline_results.csv'
+               --output 'output/baseline_tsv.csv'
 
-# With predictive scheduling (coming soon)
+# Original scheduling with BurstGPT dataset (new capability)
+python main.py --model_name 'meta-llama/Llama-3.1-8B-Instruct' \
+               --hardware 'RTX3090' --npu_num 1 --npu_group 1 \
+               --dataset 'dataset/BurstGPT_1.csv' \
+               --output 'output/baseline_burstgpt.csv' \
+               --req_num 1000
+
+# With predictive scheduling (coming in v0.3.1)
 python main.py --model_name 'meta-llama/Llama-3.1-8B-Instruct' \
                --hardware 'RTX3090' --npu_num 1 --npu_group 1 \
                --dataset 'dataset/BurstGPT_1.csv' \
                --scheduler 'predictive_rl' \
                --output 'output/predictive_results.csv'
+```
+
+### Testing Data Loading
+```bash
+# Test the universal data loader functionality
+cd test
+python test_data_loader.py
+
+# Expected: All 4 tests should pass
 ```
 
 ## 🤝 Contributing
@@ -219,4 +244,5 @@ This project is based on [LLMServingSim](https://github.com/casys-kaist/LLMServi
 ---
 
 **Last Updated**: September 25, 2025
-**Version**: Development Phase - v0.3.0 Target
+**Current Version**: v0.3.0a - Data Infrastructure Complete
+**Next Milestone**: v0.3.1 - Time Series Prediction Module
