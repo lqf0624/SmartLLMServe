@@ -1,0 +1,19 @@
+============================================================
+PREDICTION PERFORMANCE REPORT
+============================================================
+Report Time: 2025-09-25 19:58:46
+Data Points: 200
+Models Tested: 1
+
+Model: LSTM Model
+----------------------------------------
+  Prediction Confidence: 0.850
+  Predicted Requests: 10
+  Mean Absolute Error (MAE): 190.0000
+  Mean Squared Error (MSE): 36100.0000
+  Root Mean Squared Error (RMSE): 190.0000
+  Mean Absolute Percentage Error (MAPE): 95.00%
+  R-squared (R²): nan
+  Data Points Compared: 1
+
+============================================================

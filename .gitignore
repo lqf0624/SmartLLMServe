@@ -1,6 +1,8 @@
 # Ignore env file
 env/
-
+*.pt
+CLAUDE.md
+*.pkl
 # Ignore python cache
 *.pyc
 __pycache__/
