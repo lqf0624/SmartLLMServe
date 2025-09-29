@@ -18,19 +18,20 @@ SmartLLMServe builds upon the excellent [LLMServingSim](https://github.com/casys
 ## 📋 Current Status
 
 **Based on**: LLMServingSim v0.2.1 (MIT License)
-**Enhancement Target**: v0.3.0 - Predictive Scheduling Framework
-**Development Phase**: Phase 2/4 - Workload Prediction Module
+**Enhancement Target**: v0.3.1 - Enhanced Prediction Framework
+**Development Phase**: Phase 2 Complete ✅ - Ready for Phase 3 (RL Integration)
 
-### ✅ **Completed Features (v0.3.0b)**
-- **Universal Data Loader**: Multi-format dataset support (TSV/CSV)
-- **BurstGPT Integration**: Real-world workload patterns
-- **Pattern Detection**: Automatic burst/steady/sparse classification
-- **Comprehensive Testing**: Full test coverage in `test/` directory
-- **LSTM Prediction Model**: Time series forecasting with CPU/GPU support
-- **Enhanced Visualization System**: Professional actual vs predicted comparison charts
-- **Unified Prediction Interface**: Structured output for scheduling decisions
+### ✅ **Completed Features (v0.3.1)**
+- **Multi-Task Loss Function**: Optimized for arrival time, input tokens, and output tokens prediction
+- **Lightweight Architecture**: DLinear-based models for efficient time series forecasting
+- **Real Data Focus**: Exclusive use of BurstGPT dataset for authentic workload patterns
+- **Enhanced Feature Engineering**: Comprehensive temporal and statistical feature extraction
+- **Advanced Visualization System**: Professional prediction analysis with confidence intervals
+- **Comprehensive Testing Suite**: Real-data validation across all components
+- **Multi-GPU Support**: Scalable simulation infrastructure
+- **Performance Analysis Tools**: System limitation identification and optimization insights
 
-### 🚧 **Next Phase**: Time Series Prediction Module (v0.3.1)
+### 🚧 **Next Phase**: RL Scheduling Framework (v0.3.2)
 
 ## 🏗️ Architecture Overview
 
@@ -68,24 +69,30 @@ SmartLLMServe builds upon the excellent [LLMServingSim](https://github.com/casys
   - [x] Resource demand characterization
   - [x] Real-time feature computation
 
-### Phase 2: Workload Prediction Module (v0.3.0) ✅ **IN PROGRESS**
-- [x] **Time Series Prediction Models**
-  - [x] LSTM/Transformer-based forecasting
-  - [ ] Statistical baseline models (ARIMA, Prophet)
-  - [ ] Ensemble prediction methods
-  - [ ] Online learning capability
+### Phase 2: Workload Prediction Module (v0.3.1) ✅ **COMPLETED**
+- [x] **Advanced Multi-Task Loss Function**
+  - [x] Optimized for arrival time, input tokens, output tokens
+  - [x] Configurable weights for different prediction targets
+  - [x] Robust to outliers and workload variations
+  - [x] Support for both sequence and point predictions
 
-- [x] **Multi-Horizon Forecasting**
-  - [x] Short-term prediction (next 100ms)
-  - [x] Medium-term prediction (next 1s)
-  - [x] Long-term trend analysis
-  - [x] Confidence interval estimation
+- [x] **Lightweight Model Architecture**
+  - [x] DLinear-based time series decomposition
+  - [x] Removed heavy Transformer/GRU components
+  - [x] Efficient CPU/GPU deployment
+  - [x] Maintains high prediction accuracy
+
+- [x] **Real Data Integration**
+  - [x] Exclusive BurstGPT dataset usage
+  - [x] Removed synthetic ShareGPT dependencies
+  - [x] Authentic workload pattern analysis
+  - [x] Production-relevant validation
 
 - [x] **Enhanced Visualization System**
-  - [x] Comprehensive actual vs predicted comparison charts
-  - [x] Multi-scale time series analysis
-  - [x] Error distribution and confidence analysis
-  - [x] Professional statistical visualization
+  - [x] Professional prediction accuracy analysis
+  - [x] Multi-scale time series decomposition
+  - [x] Confidence interval estimation
+  - [x] Resource requirement forecasting
 
 ### Phase 3: RL Scheduling Framework (v0.3.2)
 - [ ] **Reinforcement Learning Environment**
@@ -130,9 +137,13 @@ SmartLLMServe builds upon the excellent [LLMServingSim](https://github.com/casys
 ## 📊 Dataset Support
 
 ### Currently Supported
-- **ShareGPT**: Standard conversation traces with Poisson arrival patterns
-- **BurstGPT**: Real-world bursty workload with multiple model types
-- **Custom Datasets**: Flexible format support for research scenarios
+- **BurstGPT**: Real-world production workload with authentic arrival patterns and multiple model types
+- **Custom Datasets**: Flexible format support for research scenarios (TSV/CSV)
+
+### Data Philosophy
+- **Real Data Only**: Exclusively use production-relevant datasets (removed synthetic ShareGPT data)
+- **Authentic Patterns**: Focus on real-world workload characteristics and burst scenarios
+- **Research Value**: Prioritize datasets that provide genuine insights for LLM serving optimization
 
 ### Data Format Compatibility
 ```python
@@ -172,56 +183,60 @@ cd ../../..
 
 ### Running Experiments
 ```bash
-# Original scheduling with TSV dataset (baseline)
-python main.py --model_name 'meta-llama/Llama-3.1-8B-Instruct' \
-               --hardware 'RTX3090' --npu_num 1 --npu_group 1 \
-               --dataset 'dataset/share-gpt-req100-rate10.tsv' \
-               --output 'output/baseline_tsv.csv'
-
-# Original scheduling with BurstGPT dataset (new capability)
+# Baseline scheduling with BurstGPT dataset
 python main.py --model_name 'meta-llama/Llama-3.1-8B-Instruct' \
                --hardware 'RTX3090' --npu_num 1 --npu_group 1 \
                --dataset 'dataset/BurstGPT_1.csv' \
                --output 'output/baseline_burstgpt.csv' \
                --req_num 1000
 
-# With predictive scheduling (coming in v0.3.1)
-python main.py --model_name 'meta-llama/Llama-3.1-8B-Instruct' \
-               --hardware 'RTX3090' --npu_num 1 --npu_group 1 \
-               --dataset 'dataset/BurstGPT_1.csv' \
-               --scheduler 'predictive_rl' \
-               --output 'output/predictive_results.csv'
-```
+# Multi-GPU simulation with enhanced prediction
+python multi_gpu_simulation.py --model_name 'meta-llama/Llama-3.1-8B-Instruct' \
+                              --hardware 'RTX3090' --npu_num 2 --npu_group 1 \
+                              --dataset 'dataset/BurstGPT_1.csv' \
+                              --output 'output/multi_gpu_results.csv'
 
-### Testing Data Loading
-```bash
-# Test the universal data loader functionality
-cd test
-python test_data_loader.py
+# Performance analysis and system limitation identification
+python analysis/scripts/demo_limitations.py
 
-# Expected: All 4 tests should pass
+# Quick test of multi-GPU setup
+python run_multi_gpu_quick_test.py
 ```
 
 ### Testing Prediction Module
 ```bash
-# Test the LSTM predictor and visualization system
+# Test comprehensive predictor functionality with real BurstGPT data
 cd test
 python test_predictor.py
 
-# Expected: Feature Extractor and Ensemble Predictor tests should pass
-# Generates visualization plots in predictor/test_visualization/
+# Expected: All core prediction tests should pass
+# - Feature Extractor: Real feature extraction from BurstGPT
+# - LSTM Predictor: Multi-task loss optimization
+# - Workload Predictor: End-to-end prediction pipeline
+# - Ensemble Predictor: Multi-model integration
+
+# Generates professional visualization plots in predictor/test_visualization/
 ```
 
-### Visualization Demo
+### Performance Analysis
 ```bash
-# Run standalone visualization demo
-python test_visualization_demo.py
+# Run comprehensive system analysis
+python analysis/scripts/demo_limitations.py
 
-# Output: Professional charts showing actual vs predicted comparisons
-# - Request rate analysis with confidence intervals
-# - Multi-scale time series decomposition
-# - Resource requirement forecasting
-# - Comprehensive error analysis
+# Output: System limitation analysis and improvement insights
+# - Performance bottleneck identification
+# - Resource utilization analysis
+# - Scheduling efficiency metrics
+# - Optimization recommendations
+```
+
+### Multi-GPU Testing
+```bash
+# Quick multi-GPU simulation test
+python run_multi_gpu_quick_test.py
+
+# Full multi-GPU simulation
+python multi_gpu_simulation.py --config config/multi_gpu_config.json
 ```
 
 ## 🤝 Contributing
@@ -310,6 +325,6 @@ This project is based on [LLMServingSim](https://github.com/casys-kaist/LLMServi
 
 ---
 
-**Last Updated**: September 25, 2025
-**Current Version**: v0.3.0b - Prediction Module with Enhanced Visualization
-**Next Milestone**: v0.3.1 - Statistical Models and Ensemble Methods
+**Last Updated**: September 29, 2025
+**Current Version**: v0.3.1 - Enhanced Prediction Framework with Multi-Task Loss
+**Next Milestone**: v0.3.2 - RL Scheduling Integration

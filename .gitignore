@@ -6,3 +6,9 @@ CLAUDE.md
 # Ignore python cache
 *.pyc
 __pycache__/
+output/
+.claude
+PAPER_REMINDER.md
+astra-sim/
+llm-profile/
+dataset/
