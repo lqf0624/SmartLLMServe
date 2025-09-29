@@ -25,11 +25,7 @@ import logging
 from sklearn.preprocessing import StandardScaler
 import warnings
 import time
-from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
-from rich.console import Console
-from rich.live import Live
-from rich.table import Table
-from rich.text import Text
+from tqdm import tqdm
 from .multi_task_loss import MultiTaskLoss
 
 warnings.filterwarnings('ignore')
@@ -745,48 +741,21 @@ class DLinearPredictor:
         best_model_state = None
 
         # 训练循环
-        from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
-        from rich.console import Console
-        from rich.live import Live
-        from rich.table import Table
         import time
-
-        # 计算总训练时间估算
         total_epochs = epochs
         start_time = time.time()
-        last_update_time = start_time
-        update_interval = 2.0  # 每2秒更新一次进度条
 
-        # 创建控制台和进度条 - 尝试输出到终端
-        try:
-            # 尝试直接输出到终端
-            if sys.stdout.isatty():
-                console = Console()
-            else:
-                # 如果不是终端输出，使用标准输出
-                console = Console(file=sys.stdout)
-        except:
-            # 如果失败，使用标准输出
-            console = Console(file=sys.stdout)
-
-        # 创建美观的进度条
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(bar_width=None),
-            "[progress.percentage]{task.percentage:>3.0f}%",
-            "•",
-            TimeRemainingColumn(),
-            console=console,
-            transient=False
+        # 创建进度条
+        epoch_pbar = tqdm(
+            range(total_epochs),
+            desc="Training Model",
+            unit="epoch",
+            dynamic_ncols=True,
+            mininterval=1.0
         )
 
-        # 创建训练任务
-        train_task = progress.add_task("[bold blue]Training Model", total=total_epochs)
-
-        # 使用进度条直接显示
-        with progress:
-            for epoch in range(total_epochs):
+        # 训练循环
+        for epoch in epoch_pbar:
                 self.model.train()
                 train_loss = 0.0
                 num_batches = 0
@@ -819,13 +788,6 @@ class DLinearPredictor:
                 avg_train_loss = train_loss / num_batches
                 epoch_time = time.time() - epoch_start_time
 
-                # 计算剩余时间估算
-                elapsed_time = time.time() - start_time
-                epochs_completed = epoch + 1
-                avg_epoch_time = elapsed_time / epochs_completed
-                remaining_epochs = total_epochs - epochs_completed
-                estimated_remaining_time = avg_epoch_time * remaining_epochs
-
                 # 验证阶段 - 减少验证频率
                 avg_val_loss = avg_train_loss  # 默认使用训练损失作为验证损失
                 validation_interval = 5  # 每5个epoch验证一次
@@ -848,6 +810,19 @@ class DLinearPredictor:
 
                     avg_val_loss = val_loss / val_batches if val_batches > 0 else avg_train_loss
 
+                # 更新进度条描述
+                if (epoch + 1) % validation_interval == 0 or epoch == 0 or (epoch + 1) == total_epochs:
+                    epoch_pbar.set_postfix({
+                        'Train': f'{avg_train_loss:.4f}',
+                        'Val': f'{avg_val_loss:.4f}',
+                        'Best': f'{best_val_loss:.4f}'
+                    })
+                else:
+                    epoch_pbar.set_postfix({
+                        'Loss': f'{avg_train_loss:.4f}',
+                        'Best': f'{best_val_loss:.4f}'
+                    })
+
                 # 记录历史
                 history['train_loss'].append(avg_train_loss)
                 history['val_loss'].append(avg_val_loss)
@@ -864,37 +839,10 @@ class DLinearPredictor:
                     else:
                         patience_counter += 1
 
-                # 只在达到更新间隔或特定条件下更新进度条
-                current_time = time.time()
-                should_update = (
-                    current_time - last_update_time >= update_interval or  # 达到时间间隔
-                    epoch == 0 or  # 第一个epoch
-                    epoch == total_epochs - 1 or  # 最后一个epoch
-                    is_validation_epoch or  # 验证epoch
-                    epochs_completed % 10 == 0  # 每10个epoch
-                )
-
-                if verbose and should_update:
-                    # 更新进度条
-                    progress.update(train_task, advance=1,
-                                  description=f"[bold blue]Epoch {epoch+1}/{total_epochs} | "
-                                            f"Loss: {avg_train_loss:.4f} | "
-                                            f"Best: {best_val_loss:.4f}")
-
-                    if is_validation_epoch:
-                        progress.update(train_task,
-                                      description=f"[bold blue]Epoch {epoch+1}/{total_epochs} | "
-                                                f"Train: {avg_train_loss:.4f} | "
-                                                f"Val: {avg_val_loss:.4f} | "
-                                                f"Best: {best_val_loss:.4f}")
-
-                    last_update_time = current_time
-
                 # 检查早停条件
                 if patience_counter >= patience:
                     if verbose:
                         logger.info(f"Early stopping at epoch {epoch+1} - patience limit reached")
-                        progress.update(train_task, description=f"[bold red]Early Stopped at Epoch {epoch+1}/{total_epochs}")
                     break
 
                 # 每10个epoch记录一次日志
@@ -911,9 +859,9 @@ class DLinearPredictor:
                                    f"Best Val: {best_val_loss:.4f}, "
                                    f"Time: {epoch_time:.1f}s")
 
-        # 完成进度条
+        # 关闭进度条
         if verbose:
-            progress.update(train_task, completed=total_epochs, description="[bold green]Training Completed!")
+            epoch_pbar.close()
 
         # 恢复最佳模型
         if best_model_state is not None:
