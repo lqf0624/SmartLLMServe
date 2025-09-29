@@ -19,7 +19,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from predictor.enhanced_request_predictor import EnhancedRequestPredictor, create_enhanced_predictor
 from predictor.model_interface import ModelConfig, ModelType, ModelDevice, model_registry
-from predictor.custom_models import TransformerPredictor, GRUPredictor
+# 专注于轻量化模型，删除Transformer和GRU引用
 
 def create_test_data():
     """创建测试数据 - 使用真实数据集"""
@@ -193,19 +193,19 @@ def test_model_comparison(predictor: EnhancedRequestPredictor, data: pd.DataFram
         print(f"[ERROR] 模型比较失败: {e}")
         return False
 
-def test_advanced_models():
-    """测试高级模型（Transformer, GRU）"""
-    print("\n=== 测试高级模型 ===")
+def test_lightweight_models():
+    """测试轻量化模型"""
+    print("\n=== 测试轻量化模型 ===")
 
     try:
-        # 创建专门测试高级模型的预测器
+        # 创建专门测试轻量化模型的预测器
         predictor = EnhancedRequestPredictor()
 
-        # 尝试添加Transformer和GRU模型
-        advanced_models = ['transformer', 'gru']
-        results = predictor.add_models(advanced_models)
+        # 尝试添加轻量化模型
+        lightweight_models = ['lightweight']
+        results = predictor.add_models(lightweight_models)
 
-        print("高级模型添加结果:")
+        print("轻量化模型添加结果:")
         for model_name, success in results.items():
             status = "[OK]" if success else "[ERROR]"
             print(f"  {status} {model_name}: {'成功' if success else '失败'}")

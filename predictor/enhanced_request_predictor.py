@@ -20,7 +20,7 @@ from .model_interface import (
     ModelConfig, ModelManager, ModelType, ModelDevice,
     PredictionResult, TrainingResult, model_registry
 )
-from .custom_models import TransformerPredictor, GRUPredictor
+# 专注于轻量化模型，删除Transformer和GRU引用
 from .lstm_model import LSTMPredictor
 from .dlinear_predictor_adapter import DLinearPredictorAdapter
 from .workload_predictor import PredictionHorizon
@@ -80,29 +80,16 @@ class EnhancedRequestPredictor:
                 early_stopping=True,
                 patience=10
             ),
-            'transformer': ModelConfig(
-                model_type=ModelType.TRANSFORMER,
-                model_name='transformer_default',
+            # 专注于轻量化模型，删除Transformer和GRU配置
+            'lightweight': ModelConfig(
+                model_type=ModelType.CUSTOM,
+                model_name='lightweight_default',
                 device=self.device,
                 sequence_length=50,
-                prediction_horizon=10,
-                epochs=50,
-                learning_rate=0.0005,
-                batch_size=16,
-                custom_params={
-                    'd_model': 64,
-                    'nhead': 4,
-                    'num_layers': 2
-                }
-            ),
-            'gru': ModelConfig(
-                model_type=ModelType.GRU,
-                model_name='gru_default',
-                device=self.device,
-                sequence_length=30,
-                prediction_horizon=5,
-                epochs=30,
+                prediction_horizon=1,
+                epochs=100,
                 learning_rate=0.001,
+                batch_size=32,
                 custom_params={
                     'hidden_size': 64,
                     'num_layers': 2
