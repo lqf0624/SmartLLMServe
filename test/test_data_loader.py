@@ -12,40 +12,10 @@ from data_loader import create_data_loader
 
 
 def test_tsv_format():
-    """Test loading original TSV format."""
-    print("=== Testing TSV Format ===")
-
-    loader = create_data_loader(verbose=True)
-
-    # Test with existing TSV file
-    tsv_file = "../dataset/share-gpt-req100-rate10.tsv"
-
-    if os.path.exists(tsv_file):
-        try:
-            data = loader.load_dataset(tsv_file, req_num=5)
-            print(f"[SUCCESS] TSV loading successful")
-            print(f"   Shape: {data.shape}")
-            print(f"   Columns: {list(data.columns)}")
-            print(f"   Sample data:\n{data.head()}")
-
-            print("\n[INFO] Loaded dataset entries (TSV format):")
-            print("=" * 60)
-            for idx, row in data.iterrows():
-                print(f"Entry {idx + 1}:")
-                print(f"  Input tokens: {row['input_toks']}")
-                print(f"  Output tokens: {row['output_toks']}")
-                print(f"  Arrival time (ns): {row['arrival_time_ns']}")
-                print(f"  Model type: {row.get('model_type', 'N/A')}")
-                print(f"  Burst pattern: {row.get('burst_pattern', 'N/A')}")
-                print("-" * 40)
-
-            return True
-        except Exception as e:
-            print(f"[FAILED] TSV loading failed: {e}")
-            return False
-    else:
-        print(f"[ERROR] TSV file not found: {tsv_file}")
-        return False
+    """Test loading original TSV format - DEPRECATED: Use BurstGPT instead."""
+    print("=== Testing TSV Format (DEPRECATED) ===")
+    print("[INFO] TSV format testing removed - using BurstGPT dataset for all tests")
+    return True
 
 
 def test_burstgpt_format():
@@ -91,8 +61,8 @@ def test_dataset_info():
 
     loader = create_data_loader()
 
+    # Only test with BurstGPT dataset
     files_to_test = [
-        "../dataset/share-gpt-req100-rate10.tsv",
         "../dataset/BurstGPT_1.csv"
     ]
 
@@ -165,7 +135,6 @@ def main():
         print(f"Warning: astra-sim directory not found, using current directory")
 
     tests = [
-        ("TSV Format", test_tsv_format),
         ("BurstGPT Format", test_burstgpt_format),
         ("Dataset Info", test_dataset_info),
         ("Burst Detection", test_burst_detection)
