@@ -771,16 +771,32 @@ class DLinearPredictor:
         best_model_state = None
 
         # 训练循环
-        for epoch in range(epochs):
+        from tqdm import tqdm
+        import time
+
+        # 计算总训练时间估算
+        total_epochs = epochs
+        start_time = time.time()
+
+        # 创建epoch进度条
+        epoch_pbar = tqdm(
+            range(total_epochs),
+            desc="Training",
+            unit="epoch",
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar:30}{r_bar}{bar:-10b}"
+        )
+
+        for epoch in epoch_pbar:
             self.model.train()
             train_loss = 0.0
             num_batches = 0
 
-            import time
             epoch_start_time = time.time()
 
-            # 训练阶段
-            for batch_X, batch_y in train_loader:
+            # 训练阶段 - 简化batch进度条
+            train_batches = len(train_loader)
+            for batch_idx, (batch_X, batch_y) in enumerate(train_loader):
                 batch_X = batch_X.to(self.device)
                 batch_y = batch_y.to(self.device)
 
@@ -804,51 +820,129 @@ class DLinearPredictor:
                 train_loss += loss.item()
                 num_batches += 1
 
+                # 更新epoch进度条描述
+                if verbose and batch_idx % 50 == 0:  # 每50个batch更新一次
+                    current_loss = train_loss / num_batches
+                    progress = (batch_idx + 1) / train_batches * 100
+                    epoch_pbar.set_postfix({
+                        'train_loss': f'{current_loss:.4f}',
+                        'epoch_progress': f'{progress:.1f}%',
+                        'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
+                    })
+
             avg_train_loss = train_loss / num_batches
 
-            # 验证阶段
-            self.model.eval()
-            val_loss = 0.0
-            val_batches = 0
-
-            with torch.no_grad():
-                for batch_X, batch_y in val_loader:
-                    batch_X = batch_X.to(self.device)
-                    batch_y = batch_y.to(self.device)
-
-                    predictions = self.model(batch_X)  # [batch_size, output_size, 3]
-                    batch_y_expanded = batch_y.unsqueeze(1).expand(-1, predictions.shape[1], -1)
-                    loss = self.criterion(predictions, batch_y_expanded)
-                    val_loss += loss.item()
-                    val_batches += 1
-
-            avg_val_loss = val_loss / val_batches if val_batches > 0 else avg_train_loss
-
             epoch_time = time.time() - epoch_start_time
+
+            # 计算剩余时间估算
+            elapsed_time = time.time() - start_time
+            epochs_completed = epoch + 1
+            avg_epoch_time = elapsed_time / epochs_completed
+            remaining_epochs = total_epochs - epochs_completed
+            estimated_remaining_time = avg_epoch_time * remaining_epochs
+
+            # 验证阶段 - 减少验证频率
+            avg_val_loss = avg_train_loss  # 默认使用训练损失作为验证损失
+            validation_interval = 5  # 每5个epoch验证一次
+
+            if (epoch + 1) % validation_interval == 0 or epoch == 0 or (epoch + 1) == total_epochs:
+                self.model.eval()
+                val_loss = 0.0
+                val_batches = 0
+
+                with torch.no_grad():
+                    for batch_X, batch_y in val_loader:
+                        batch_X = batch_X.to(self.device)
+                        batch_y = batch_y.to(self.device)
+
+                        predictions = self.model(batch_X)  # [batch_size, output_size, 3]
+                        batch_y_expanded = batch_y.unsqueeze(1).expand(-1, predictions.shape[1], -1)
+                        loss = self.criterion(predictions, batch_y_expanded)
+                        val_loss += loss.item()
+                        val_batches += 1
+
+                avg_val_loss = val_loss / val_batches if val_batches > 0 else avg_train_loss
+
+                # 验证完成后更新进度条
+                if verbose:
+                    epoch_pbar.set_postfix({
+                        'train_loss': f'{avg_train_loss:.4f}',
+                        'val_loss': f'{avg_val_loss:.4f}',
+                        'best_val': f'{best_val_loss:.4f}',
+                        'ETA': f'{estimated_remaining_time/60:.1f}m'
+                    })
+            else:
+                # 非验证epoch，只显示训练损失
+                if verbose:
+                    epoch_pbar.set_postfix({
+                        'train_loss': f'{avg_train_loss:.4f}',
+                        'best_val': f'{best_val_loss:.4f}',
+                        'ETA': f'{estimated_remaining_time/60:.1f}m'
+                    })
 
             # 记录历史
             history['train_loss'].append(avg_train_loss)
             history['val_loss'].append(avg_val_loss)
             history['epoch_times'].append(epoch_time)
 
-            if verbose and epoch % 10 == 0:
-                logger.info(f"Epoch {epoch}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+            # 只在验证epoch进行早停检查
+            if (epoch + 1) % validation_interval == 0 or epoch == 0 or (epoch + 1) == total_epochs:
+                # 早停检查
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                    best_model_state = self.model.state_dict().copy()
 
-            # 早停检查
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                patience_counter = 0
-                best_model_state = self.model.state_dict().copy()
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
+                    # 更新进度条显示保存了最佳模型
                     if verbose:
-                        logger.info(f"Early stopping at epoch {epoch}")
-                    break
+                        epoch_pbar.set_postfix({
+                            'train_loss': f'{avg_train_loss:.4f}',
+                            'val_loss': f'{avg_val_loss:.4f}',
+                            'best_val': f'{best_val_loss:.4f} ✓',
+                            'patience': f'{patience_counter}/{patience}',
+                            'ETA': f'{estimated_remaining_time/60:.1f}m'
+                        })
+                else:
+                    patience_counter += 1
+                    if verbose:
+                        epoch_pbar.set_postfix({
+                            'train_loss': f'{avg_train_loss:.4f}',
+                            'val_loss': f'{avg_val_loss:.4f}',
+                            'best_val': f'{best_val_loss:.4f}',
+                            'patience': f'{patience_counter}/{patience}',
+                            'ETA': f'{estimated_remaining_time/60:.1f}m'
+                        })
+
+                    if patience_counter >= patience:
+                        if verbose:
+                            logger.info(f"Early stopping at epoch {epoch+1} - patience limit reached")
+                            epoch_pbar.set_description("Training completed (Early stopped)")
+                        break
+
+            # 每10个epoch记录一次日志
+            if verbose and epoch % 10 == 0:
+                if (epoch + 1) % validation_interval == 0 or epoch == 0:
+                    logger.info(f"Epoch {epoch+1}/{total_epochs}: "
+                               f"Train Loss: {avg_train_loss:.4f}, "
+                               f"Val Loss: {avg_val_loss:.4f}, "
+                               f"Best Val: {best_val_loss:.4f}, "
+                               f"Time: {epoch_time:.1f}s")
+                else:
+                    logger.info(f"Epoch {epoch+1}/{total_epochs}: "
+                               f"Train Loss: {avg_train_loss:.4f}, "
+                               f"Best Val: {best_val_loss:.4f}, "
+                               f"Time: {epoch_time:.1f}s")
+
+        # 关闭进度条
+        if verbose:
+            epoch_pbar.close()
 
         # 恢复最佳模型
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
+
+        # 计算总训练时间
+        total_time = time.time() - start_time
 
         result = {
             'train_loss': history['train_loss'],
@@ -857,10 +951,25 @@ class DLinearPredictor:
             'total_epochs': len(history['train_loss']),
             'best_val_loss': best_val_loss,
             'final_train_loss': avg_train_loss,
-            'early_stopped': patience_counter >= patience
+            'early_stopped': patience_counter >= patience,
+            'total_time': total_time
         }
 
-        logger.info(f"Training completed: {result}")
+        if verbose:
+            # 打印训练总结
+            logger.info("=" * 60)
+            logger.info("训练完成总结:")
+            logger.info(f"总训练时间: {total_time:.1f}秒 ({total_time/60:.1f}分钟)")
+            logger.info(f"总epoch数: {len(history['train_loss'])}")
+            logger.info(f"最佳验证损失: {best_val_loss:.6f}")
+            logger.info(f"最终训练损失: {avg_train_loss:.6f}")
+            logger.info(f"平均epoch时间: {np.mean(history['epoch_times']):.1f}秒")
+            if patience_counter >= patience:
+                logger.info("状态: 早停 (防止过拟合)")
+            else:
+                logger.info("状态: 正常完成")
+            logger.info("=" * 60)
+
         return result
 
     def predict(self, data: pd.DataFrame, steps: Optional[int] = None) -> torch.Tensor:
@@ -885,13 +994,19 @@ class DLinearPredictor:
 
         # 列名映射：处理不同的数据集格式
         if 'Request tokens' in data.columns and 'Response tokens' in data.columns:
-            # BurstGPT数据集格式
+            # BurstGPT原始数据集格式
             data = data.rename(columns={
                 'Request tokens': 'input_toks',
                 'Response tokens': 'output_toks'
             })
+        elif 'Request_tokens_sum' in data.columns and 'Response_tokens_sum' in data.columns:
+            # 分钟级聚合数据集格式
+            data = data.rename(columns={
+                'Request_tokens_sum': 'input_toks',
+                'Response_tokens_sum': 'output_toks'
+            })
         elif 'input_toks' not in data.columns or 'output_toks' not in data.columns:
-            raise ValueError("数据必须包含'Request tokens'/'Response tokens'或'input_toks'/'output_toks'列")
+            raise ValueError("数据必须包含'Request tokens'/'Response tokens'或'Request_tokens_sum'/'Response_tokens_sum'或'input_toks'/'output_toks'列")
 
         # 按时间戳排序
         data = data.sort_values('Timestamp').reset_index(drop=True)

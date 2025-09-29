@@ -22,6 +22,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from predictor.dlinear_model import DLinearPredictor
 import wandb
+from tqdm import tqdm
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -175,7 +176,7 @@ class PredictorTrainer:
         logger.info("开始评估")
 
         # 进行预测
-        predictions = model.predict_future(val_data, steps=self.config.get('prediction_horizon', 10))
+        predictions = model.predict(val_data, steps=self.config.get('prediction_horizon', 10))
 
         # 计算各种指标
         metrics = self._calculate_metrics(predictions, val_data)
@@ -184,7 +185,6 @@ class PredictorTrainer:
         if self.wandb_run:
             wandb.log({
                 'eval_metrics': metrics,
-                'prediction_confidence': predictions['confidence']
             })
 
             # 创建预测对比图表
@@ -192,22 +192,26 @@ class PredictorTrainer:
 
         return metrics
 
-    def _calculate_metrics(self, predictions: Dict, val_data: pd.DataFrame) -> Dict:
+    def _calculate_metrics(self, predictions: torch.Tensor, val_data: pd.DataFrame) -> Dict:
         """计算评估指标"""
-        # 这里可以添加更复杂的指标计算
-        pred_values = np.array(predictions['predictions'])
-        confidence = predictions['confidence']
+        # 处理预测结果
+        if isinstance(predictions, torch.Tensor):
+            pred_values = predictions.cpu().numpy()
+        else:
+            pred_values = np.array(predictions)
 
         metrics = {
-            'mean_confidence': np.mean(confidence),
-            'std_confidence': np.std(confidence),
             'prediction_shape': pred_values.shape,
-            'total_predicted_requests': pred_values.shape[0] * pred_values.shape[1] if len(pred_values.shape) > 1 else pred_values.shape[0]
+            'mean_prediction': np.mean(pred_values),
+            'std_prediction': np.std(pred_values),
+            'min_prediction': np.min(pred_values),
+            'max_prediction': np.max(pred_values),
+            'validation_data_size': len(val_data)
         }
 
         return metrics
 
-    def _log_prediction_plots(self, predictions: Dict, val_data: pd.DataFrame):
+    def _log_prediction_plots(self, predictions: torch.Tensor, val_data: pd.DataFrame):
         """记录预测图表到wandb"""
         try:
             import matplotlib.pyplot as plt
@@ -225,22 +229,41 @@ class PredictorTrainer:
                 axes[0, 0].legend()
                 axes[0, 0].grid(True)
 
-            # 图2: 预测置信度分布
-            confidence = predictions['confidence']
-            axes[0, 1].hist(confidence, bins=20, alpha=0.7)
-            axes[0, 1].set_title('Prediction Confidence Distribution')
-            axes[0, 1].set_xlabel('Confidence')
+            # 图2: 预测值分布
+            if isinstance(predictions, torch.Tensor):
+                pred_values = predictions.cpu().numpy()
+            else:
+                pred_values = np.array(predictions)
+
+            axes[0, 1].hist(pred_values.flatten(), bins=20, alpha=0.7)
+            axes[0, 1].set_title('Prediction Values Distribution')
+            axes[0, 1].set_xlabel('Prediction Value')
             axes[0, 1].set_ylabel('Frequency')
             axes[0, 1].grid(True)
 
+            # 图3: 验证数据时间序列
+            axes[1, 0].plot(val_data['Concurrent_requests'].values[-100:])  # 最近100个点
+            axes[1, 0].set_title('Validation Data - Concurrent Requests (Last 100 points)')
+            axes[1, 0].set_xlabel('Time')
+            axes[1, 0].set_ylabel('Concurrent Requests')
+            axes[1, 0].grid(True)
+
+            # 图4: 预测统计
+            axes[1, 1].bar(['Mean', 'Std', 'Min', 'Max'],
+                          [np.mean(pred_values), np.std(pred_values),
+                           np.min(pred_values), np.max(pred_values)])
+            axes[1, 1].set_title('Prediction Statistics')
+            axes[1, 1].set_ylabel('Value')
+            axes[1, 1].grid(True)
+
             # 保存图表
             plt.tight_layout()
-            plt.savefig(self.output_dir / 'training_summary.png', dpi=150, bbox_inches='tight')
+            plt.savefig(self.output_dir / 'evaluation_summary.png', dpi=150, bbox_inches='tight')
 
             # 上传到wandb
             if self.wandb_run:
                 wandb.log({
-                    'training_summary': wandb.Image(str(self.output_dir / 'training_summary.png'))
+                    'evaluation_summary': wandb.Image(str(self.output_dir / 'evaluation_summary.png'))
                 })
 
             plt.close()
