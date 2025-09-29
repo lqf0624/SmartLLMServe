@@ -1,0 +1,33 @@
+{
+  "model_type": "DLinear",
+  "sequence_length": 120,
+  "prediction_horizon": 3,
+  "batch_size": 64,
+  "learning_rate": 0.001,
+  "epochs": 150,
+  "channels": 3,
+  "individual": true,
+  "kernel_size": 25,
+  "early_stopping_patience": 15,
+  "device": "cuda",
+  "output_dir": "./training_output",
+  "use_wandb": true,
+  "wandb_project": "smartllm-serve",
+  "wandb_entity": null,
+  "wandb_run_name": null,
+  "data_augmentation": {
+    "enabled": false,
+    "noise_factor": 0.05,
+    "time_warp_factor": 0.1
+  },
+  "regularization": {
+    "l2_lambda": 0.0001,
+    "dropout_rate": 0.1
+  },
+  "optimization": {
+    "optimizer": "adam",
+    "weight_decay": 0.0001,
+    "scheduler": "cosine",
+    "scheduler_patience": 5
+  }
+}
