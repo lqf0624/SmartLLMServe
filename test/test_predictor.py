@@ -36,8 +36,8 @@ def test_feature_extractor():
     print("=== Testing Feature Extractor ===")
 
     try:
-        # Create synthetic test data
-        test_data = create_synthetic_data(50)
+        # Load real BurstGPT test data
+        test_data = load_burstgpt_data(50)
 
         # Test basic feature extraction
         extractor = FeatureExtractor(window_size=5, normalize=True)
@@ -75,7 +75,7 @@ def test_lstm_predictor():
 
     try:
         # Create test data
-        test_data = create_synthetic_data(100)
+        test_data = load_burstgpt_data(100)
 
         # Initialize LSTM predictor
         predictor = LSTMPredictor(
@@ -141,7 +141,7 @@ def test_workload_predictor():
 
     try:
         # Create test data
-        test_data = create_synthetic_data(150)
+        test_data = load_burstgpt_data(150)
 
         # Test LSTM workload predictor
         workload_pred = WorkloadPredictor(
@@ -266,7 +266,7 @@ def test_ensemble_predictor():
 
     try:
         # Create test data
-        test_data = create_synthetic_data(100)
+        test_data = load_burstgpt_data(100)
 
         # Test ensemble predictor (with only LSTM for now)
         ensemble_pred = WorkloadPredictor(
@@ -301,8 +301,41 @@ def test_ensemble_predictor():
         return False
 
 
+def load_burstgpt_data(num_requests: int = 1000) -> pd.DataFrame:
+    """Load real BurstGPT data for testing."""
+    try:
+        # 读取BurstGPT数据集
+        data_path = '../dataset/BurstGPT_1.csv'
+        data = pd.read_csv(data_path)
+
+        # 重命名列以匹配我们的格式
+        data = data.rename(columns={
+            'Timestamp': 'Timestamp',
+            'Request tokens': 'input_toks',
+            'Response tokens': 'output_toks'
+        })
+
+        # 只保留我们需要的列
+        data = data[['Timestamp', 'input_toks', 'output_toks']].copy()
+
+        # 使用指定数量的数据
+        data = data.head(num_requests).copy()
+
+        print(f"Loaded BurstGPT data: {len(data)} samples")
+        print(f"Time range: {data['Timestamp'].min()} to {data['Timestamp'].max()}")
+        print(f"Input tokens range: {data['input_toks'].min()} to {data['input_toks'].max()}")
+        print(f"Output tokens range: {data['output_toks'].min()} to {data['output_toks'].max()}")
+
+        return data
+
+    except FileNotFoundError:
+        print(f"Warning: BurstGPT dataset not found at {'../dataset/BurstGPT_1.csv'}")
+        print("Using synthetic data for testing...")
+        return create_synthetic_data(num_requests)
+
+
 def create_synthetic_data(num_requests: int) -> pd.DataFrame:
-    """Create synthetic test data."""
+    """Create synthetic test data (fallback)."""
     np.random.seed(42)  # For reproducible results
 
     # Generate timestamps with some patterns

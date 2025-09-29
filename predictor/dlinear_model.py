@@ -4,10 +4,16 @@ DLinear模型实现 - 基于AAAI 2023论文
 "Are Transformers Effective for Time Series Forecasting?"
 实现时序分解+线性网络的高效预测模型。
 
+修改说明：
+- 适配多任务Loss函数，直接预测三个目标值：时间间隔、输入token、输出token
+- 使用真实的时间序列数据而非预处理后的特征
+- 集成新的多任务损失函数
+
 核心思想：
 1. 将时间序列分解为趋势和季节性组件
 2. 使用单层线性网络分别预测
 3. 重建最终预测结果
+4. 直接优化LLM服务的核心预测目标
 """
 
 import torch
@@ -20,6 +26,7 @@ from enum import Enum
 import logging
 from sklearn.preprocessing import StandardScaler
 import warnings
+from .multi_task_loss import MultiTaskLoss
 
 warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
@@ -305,8 +312,12 @@ class DLinearPredictor:
         # 优化器
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
 
-        # 损失函数
-        self.criterion = nn.MSELoss()
+        # 多任务损失函数
+        self.criterion = MultiTaskLoss(
+            time_weight=1.0,
+            input_token_weight=0.5,
+            output_token_weight=0.5
+        )
 
         # 数据标准化器
         self.scaler = StandardScaler()
@@ -324,26 +335,83 @@ class DLinearPredictor:
         准备训练数据
 
         Args:
-            data: 输入DataFrame，包含input_toks和output_toks列
+            data: 输入DataFrame，包含Timestamp, input_toks, output_toks列
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (输入序列, 目标序列)
         """
-        # 提取特征
-        features = data[['input_toks', 'output_toks']].values
+        # 确保数据有时间戳
+        if 'Timestamp' not in data.columns:
+            raise ValueError("数据必须包含Timestamp列")
 
-        # 标准化
-        features_scaled = self.scaler.fit_transform(features)
+        # 按时间戳排序
+        data = data.sort_values('Timestamp').reset_index(drop=True)
 
-        # 创建序列
+        # 计算时间间隔（纳秒）
+        time_intervals = np.diff(data['Timestamp'].values)
+
+        # 提取特征和目标
+        input_tokens = data['input_toks'].values[:-1]  # 除了最后一个
+        output_tokens = data['output_toks'].values[:-1]  # 除了最后一个
+
+        # 目标值：下一个请求的时间间隔、输入token、输出token
+        target_time_intervals = time_intervals
+        target_input_tokens = data['input_toks'].values[1:]  # 从第二个开始
+        target_output_tokens = data['output_toks'].values[1:]  # 从第二个开始
+
+        # 创建输入序列（包含时间间隔、输入token、输出token）
         sequences = []
         targets = []
 
-        for i in range(len(features_scaled) - self.input_size - self.output_size + 1):
-            seq = features_scaled[i:i + self.input_size]
-            target = features_scaled[i + self.input_size:i + self.input_size + self.output_size]
-            sequences.append(seq)
-            targets.append(target)
+        for i in range(len(input_tokens) - self.input_size + 1):
+            # 输入序列：[time_interval, input_token, output_token]
+            seq_features = []
+            for j in range(i, i + self.input_size):
+                if j == 0:
+                    time_interval = 0  # 第一个请求的时间间隔设为0
+                else:
+                    time_interval = time_intervals[j-1]
+
+                seq_features.append([
+                    time_interval,
+                    input_tokens[j],
+                    output_tokens[j]
+                ])
+
+            sequences.append(seq_features)
+
+            # 目标：未来output_size个请求的三个值
+            target_seq = []
+            for j in range(self.output_size):
+                target_idx = i + self.input_size + j
+                if target_idx < len(target_time_intervals):
+                    target_seq.append([
+                        target_time_intervals[target_idx],
+                        target_input_tokens[target_idx],
+                        target_output_tokens[target_idx]
+                    ])
+                else:
+                    # 数据不足时用最后一个值填充
+                    target_seq.append([
+                        target_time_intervals[-1],
+                        target_input_tokens[-1],
+                        target_output_tokens[-1]
+                    ])
+            targets.append(target_seq)
+
+        sequences = np.array(sequences)
+        targets = np.array(targets)
+
+        # 标准化
+        if len(sequences) > 0:
+            # 对每个特征分别标准化
+            for feature_idx in range(sequences.shape[-1]):
+                mean_val = sequences[:, :, feature_idx].mean()
+                std_val = sequences[:, :, feature_idx].std()
+                if std_val > 0:
+                    sequences[:, :, feature_idx] = (sequences[:, :, feature_idx] - mean_val) / std_val
+                else:
+                    sequences[:, :, feature_idx] = sequences[:, :, feature_idx] - mean_val
 
         return torch.FloatTensor(sequences), torch.FloatTensor(targets)
 
@@ -396,7 +464,10 @@ class DLinearPredictor:
 
                 self.optimizer.zero_grad()
                 outputs = self.model(batch_X)
-                loss = self.criterion(outputs, batch_y)
+
+                # 计算多任务损失
+                loss_dict = self.criterion(outputs, batch_y)
+                loss = loss_dict['total_loss']
                 loss.backward()
                 self.optimizer.step()
 
@@ -414,7 +485,9 @@ class DLinearPredictor:
                     batch_y = y_val[i:i + batch_size].to(self.device)
 
                     outputs = self.model(batch_X)
-                    loss = self.criterion(outputs, batch_y)
+                    # 计算多任务损失
+                    loss_dict = self.criterion(outputs, batch_y)
+                    loss = loss_dict['total_loss']
                     val_loss += loss.item()
 
             val_loss /= (len(X_val) // batch_size + 1)
@@ -462,29 +535,62 @@ class DLinearPredictor:
             steps: 预测步数，默认使用output_size
 
         Returns:
-            torch.Tensor: 预测结果
+            torch.Tensor: 预测结果，每行包含[时间间隔, 输入token, 输出token]
         """
         if steps is None:
             steps = self.output_size
 
         self.model.eval()
 
+        # 确保数据有时间戳
+        if 'Timestamp' not in data.columns:
+            raise ValueError("数据必须包含Timestamp列")
+
+        # 按时间戳排序
+        data = data.sort_values('Timestamp').reset_index(drop=True)
+
         # 准备输入序列
         if len(data) < self.input_size:
-            # 数据不足时使用零填充
             logger.warning(f"Insufficient data: {len(data)} < {self.input_size}")
+            # 使用零填充
             padding_size = self.input_size - len(data)
-            features = np.zeros((self.input_size, 2))
+            sequences = np.zeros((self.input_size, 3))
             if len(data) > 0:
-                features[-len(data):] = data[['input_toks', 'output_toks']].values
+                # 计算时间间隔
+                time_intervals = np.diff(data['Timestamp'].values)
+                for i in range(len(data)):
+                    if i == 0:
+                        sequences[padding_size + i] = [0, data.iloc[i]['input_toks'], data.iloc[i]['output_toks']]
+                    else:
+                        sequences[padding_size + i] = [time_intervals[i-1], data.iloc[i]['input_toks'], data.iloc[i]['output_toks']]
         else:
-            features = data[['input_toks', 'output_toks']].values[-self.input_size:]
+            # 使用最新的input_size个数据点
+            recent_data = data.iloc[-self.input_size:].copy()
+            sequences = []
 
-        # 标准化
-        features_scaled = self.scaler.transform(features)
+            # 计算时间间隔
+            time_intervals = np.diff(recent_data['Timestamp'].values)
+
+            for i in range(len(recent_data)):
+                if i == 0:
+                    # 第一个请求，时间间隔为0
+                    sequences.append([0, recent_data.iloc[i]['input_toks'], recent_data.iloc[i]['output_toks']])
+                else:
+                    sequences.append([time_intervals[i-1], recent_data.iloc[i]['input_toks'], recent_data.iloc[i]['output_toks']])
+
+            sequences = np.array(sequences)
+
+        # 标准化（使用与训练相同的方法）
+        for feature_idx in range(sequences.shape[-1]):
+            mean_val = sequences[:, feature_idx].mean()
+            std_val = sequences[:, feature_idx].std()
+            if std_val > 0:
+                sequences[:, feature_idx] = (sequences[:, feature_idx] - mean_val) / std_val
+            else:
+                sequences[:, feature_idx] = sequences[:, feature_idx] - mean_val
 
         # 转换为张量
-        input_tensor = torch.FloatTensor(features_scaled).unsqueeze(0).to(self.device)
+        input_tensor = torch.FloatTensor(sequences).unsqueeze(0).to(self.device)
 
         # 预测
         with torch.no_grad():
@@ -492,39 +598,11 @@ class DLinearPredictor:
 
         # 反标准化
         prediction = prediction.squeeze(0).cpu().numpy()
-        prediction = self.scaler.inverse_transform(prediction)
 
-        # 如果需要调整预测步数
-        if steps != self.output_size:
-            if steps < self.output_size:
-                prediction = prediction[:steps]
-            else:
-                # 对于更长的预测，使用递归预测
-                prediction = self._recursive_predict(data, steps)
-
+        # 返回预测结果
         return torch.FloatTensor(prediction)
 
-    def _recursive_predict(self, data: pd.DataFrame, steps: int) -> np.ndarray:
-        """递归预测长序列"""
-        predictions = []
-        current_data = data.copy()
-
-        for _ in range(0, steps, self.output_size):
-            # 预测下一个output_size步
-            pred = self.predict(current_data, min(self.output_size, steps - len(predictions)))
-            predictions.append(pred.numpy())
-
-            # 更新数据（使用预测的值）
-            new_data = pd.DataFrame({
-                'input_toks': pred[:, 0],
-                'output_toks': pred[:, 1]
-            })
-            current_data = pd.concat([current_data, new_data], ignore_index=True)
-
-        # 合并所有预测
-        result = np.vstack(predictions)
-        return result[:steps]  # 确保返回正确的步数
-
+  
     def analyze_decomposition(self, data: pd.DataFrame) -> Dict[str, Any]:
         """
         分析时序分解结果
@@ -537,16 +615,43 @@ class DLinearPredictor:
         """
         self.model.eval()
 
-        # 准备输入
-        if len(data) < self.input_size:
-            features = np.zeros((self.input_size, 2))
-            if len(data) > 0:
-                features[-len(data):] = data[['input_toks', 'output_toks']].values
-        else:
-            features = data[['input_toks', 'output_toks']].values[-self.input_size:]
+        # 确保数据有时间戳
+        if 'Timestamp' not in data.columns:
+            raise ValueError("数据必须包含Timestamp列")
 
-        features_scaled = self.scaler.transform(features)
-        input_tensor = torch.FloatTensor(features_scaled).unsqueeze(0).to(self.device)
+        # 按时间戳排序
+        data = data.sort_values('Timestamp').reset_index(drop=True)
+
+        # 准备输入（使用与predict相同的方法）
+        if len(data) < self.input_size:
+            logger.warning(f"Insufficient data for decomposition analysis: {len(data)} < {self.input_size}")
+            return {'error': 'Insufficient data'}
+
+        # 使用最新的input_size个数据点
+        recent_data = data.iloc[-self.input_size:].copy()
+        sequences = []
+
+        # 计算时间间隔
+        time_intervals = np.diff(recent_data['Timestamp'].values)
+
+        for i in range(len(recent_data)):
+            if i == 0:
+                sequences.append([0, recent_data.iloc[i]['input_toks'], recent_data.iloc[i]['output_toks']])
+            else:
+                sequences.append([time_intervals[i-1], recent_data.iloc[i]['input_toks'], recent_data.iloc[i]['output_toks']])
+
+        sequences = np.array(sequences)
+
+        # 标准化
+        for feature_idx in range(sequences.shape[-1]):
+            mean_val = sequences[:, feature_idx].mean()
+            std_val = sequences[:, feature_idx].std()
+            if std_val > 0:
+                sequences[:, feature_idx] = (sequences[:, feature_idx] - mean_val) / std_val
+            else:
+                sequences[:, feature_idx] = sequences[:, feature_idx] - mean_val
+
+        input_tensor = torch.FloatTensor(sequences).unsqueeze(0).to(self.device)
 
         # 获取分解分析
         with torch.no_grad():
@@ -615,12 +720,43 @@ def test_dlinear_model():
     """测试DLinear模型"""
     print("Testing DLinear model...")
 
-    # 创建测试数据
-    np.random.seed(42)
-    data = pd.DataFrame({
-        'input_toks': np.random.randint(50, 200, 1000),
-        'output_toks': np.random.randint(100, 500, 1000)
-    })
+    # 使用真实的BurstGPT数据集
+    try:
+        # 读取BurstGPT数据集
+        data_path = '../dataset/BurstGPT_1.csv'
+        data = pd.read_csv(data_path)
+
+        # 重命名列以匹配我们的格式
+        data = data.rename(columns={
+            'Timestamp': 'Timestamp',
+            'Request tokens': 'input_toks',
+            'Response tokens': 'output_toks'
+        })
+
+        # 只保留我们需要的列
+        data = data[['Timestamp', 'input_toks', 'output_toks']].copy()
+
+        # 使用前1000条数据
+        data = data.head(1000).copy()
+
+        print(f"Loaded BurstGPT data: {len(data)} samples")
+        print(f"Columns: {list(data.columns)}")
+        print(f"Time range: {data['Timestamp'].min()} to {data['Timestamp'].max()}")
+        print(f"Input tokens range: {data['input_toks'].min()} to {data['input_toks'].max()}")
+        print(f"Output tokens range: {data['output_toks'].min()} to {data['output_toks'].max()}")
+
+    except FileNotFoundError:
+        print(f"Warning: BurstGPT dataset not found at {data_path}")
+        print("Using synthetic data for testing...")
+        # 备用：创建合成数据
+        np.random.seed(42)
+        n_samples = 1000
+        timestamps = np.cumsum(np.random.exponential(scale=1e8, size=n_samples)).astype(int)
+        data = pd.DataFrame({
+            'Timestamp': timestamps,
+            'input_toks': np.random.randint(50, 200, n_samples),
+            'output_toks': np.random.randint(100, 500, n_samples)
+        })
 
     # 创建预测器
     predictor = create_dlinear_predictor(input_size=50, output_size=10)
@@ -640,6 +776,7 @@ def test_dlinear_model():
     print(f"DLinear model test completed:")
     print(f"  Training result: {result}")
     print(f"  Predictions shape: {predictions.shape}")
+    print(f"  Sample prediction: {predictions[0]}")
     print(f"  Decomposition analysis: {analysis}")
 
     return predictor
