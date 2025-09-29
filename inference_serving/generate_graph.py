@@ -17,7 +17,7 @@ def generate_graph(batch, hardware, total_num, event=False):
     workload_dir = f'../../../inputs/workload/{file_name}'
     os.makedirs(workload_dir, exist_ok=True)
 
-    cmd = f'python -m chakra.src.converter.converter LLM ' \
+    cmd = f'python3 -m chakra.src.converter.converter LLM ' \
             f'--input ../../../inputs/trace/{file_name}.txt ' \
             f'--output ../../../inputs/workload/{file_name}/llm ' \
             f'--num-npus {total_num}'

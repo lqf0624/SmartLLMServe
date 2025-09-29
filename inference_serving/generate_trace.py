@@ -112,14 +112,20 @@ def synthsize_trace(hardware, model, total_len, attn, init, output_path, tp, fp=
                 if init[i]:
                     rope_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == attn[i]) & (df['kv_cache'] == 0) & (df['layer_name'] == "rope")]
                 else:
-                    rope_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == attn[i]) & (df['layer_name'] == "rope")]
+                    # For large KV cache values, use nearest available configuration
+                    available_kv_cache = df[df['layer_name'] == "rope"]['kv_cache'].unique()
+                    target_kv_cache = min(attn[i], max(available_kv_cache))
+                    rope_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == target_kv_cache) & (df['layer_name'] == "rope")]
                 rope_input, rope_weight, rope_output = calculate_sizes(model, rope_matching_row["layer_name"].values[0], attn[i], init[i])
                 block_res.append(formatter(str(rope_matching_row["layer_name"].values[0]), str(rope_matching_row['latency(ns)'].values[0]), 'REMOTE', str(rope_input), 'LOCAL', str(rope_weight), 'REMOTE',  str(rope_output), 'NONE', '0', 'NONE', 'hybrid'))
                 # Attention
                 if init[i]:
                     attn_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == attn[i]) & (df['kv_cache'] == 0) & (df['layer_name'] == "attn")]
                 else:
-                    attn_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == attn[i]) & (df['layer_name'] == "attn")]
+                    # For large KV cache values, use nearest available configuration
+                    available_kv_cache = df[df['layer_name'] == "attn"]['kv_cache'].unique()
+                    target_kv_cache = min(attn[i], max(available_kv_cache))
+                    attn_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == target_kv_cache) & (df['layer_name'] == "attn")]
                 attn_input, attn_weight, attn_output = calculate_sizes(model, attn_matching_row["layer_name"].values[0], attn[i], init[i])
                 block_res.append(formatter(str(attn_matching_row["layer_name"].values[0]), str(attn_matching_row['latency(ns)'].values[0]), 'REMOTE', str(attn_input), 'LOCAL', str(attn_weight), 'REMOTE',  str(attn_output), 'NONE', '0', 'NONE', 'hybrid'))
             else:
@@ -127,21 +133,30 @@ def synthsize_trace(hardware, model, total_len, attn, init, output_path, tp, fp=
                 if init[i]:
                     qk_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == attn[i]) & (df['kv_cache'] == 0) & (df['layer_name'] == "qk_matmul")]
                 else:
-                    qk_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == attn[i]) & (df['layer_name'] == "qk_matmul")]
+                    # For large KV cache values, use nearest available configuration
+                    available_kv_cache = df[df['layer_name'] == "qk_matmul"]['kv_cache'].unique()
+                    target_kv_cache = min(attn[i], max(available_kv_cache))
+                    qk_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == target_kv_cache) & (df['layer_name'] == "qk_matmul")]
                 qk_input, qk_weight, qk_output = calculate_sizes(model, qk_matching_row["layer_name"].values[0], attn[i], init[i])
                 block_res.append(formatter(str(qk_matching_row["layer_name"].values[0]), str(qk_matching_row['latency(ns)'].values[0]), 'REMOTE', str(qk_input), 'LOCAL', str(qk_weight), 'REMOTE',  str(qk_output), 'NONE', '0', 'NONE', 'hybrid'))
                 # softmax
                 if init[i]:
                     softmax_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == attn[i]) & (df['kv_cache'] == 0) & (df['layer_name'] == "softmax")]
                 else:
-                    softmax_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == attn[i]) & (df['layer_name'] == "softmax")]
+                    # For large KV cache values, use nearest available configuration
+                    available_kv_cache = df[df['layer_name'] == "softmax"]['kv_cache'].unique()
+                    target_kv_cache = min(attn[i], max(available_kv_cache))
+                    softmax_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == target_kv_cache) & (df['layer_name'] == "softmax")]
                 softmax_input, softmax_weight, softmax_output = calculate_sizes(model, softmax_matching_row["layer_name"].values[0], attn[i], init[i])
                 block_res.append(formatter(str(softmax_matching_row["layer_name"].values[0]), str(softmax_matching_row['latency(ns)'].values[0]), 'REMOTE', str(softmax_input), 'LOCAL', str(softmax_weight), 'REMOTE',  str(softmax_output), 'NONE', '0', 'NONE', 'hybrid'))
                 # SV matmul
                 if init[i]:
                     sv_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == attn[i]) & (df['kv_cache'] == 0) & (df['layer_name'] == "sv_matmul")]
                 else:
-                    sv_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == attn[i]) & (df['layer_name'] == "sv_matmul")]
+                    # For large KV cache values, use nearest available configuration
+                    available_kv_cache = df[df['layer_name'] == "sv_matmul"]['kv_cache'].unique()
+                    target_kv_cache = min(attn[i], max(available_kv_cache))
+                    sv_matching_row = df[(df['model'] == model) & (df['hardware'] == hardware) & (df['input'] == 1) & (df['kv_cache'] == target_kv_cache) & (df['layer_name'] == "sv_matmul")]
                 sv_input, sv_weight, sv_output = calculate_sizes(model, sv_matching_row["layer_name"].values[0], attn[i], init[i])
                 block_res.append(formatter(str(sv_matching_row["layer_name"].values[0]), str(sv_matching_row['latency(ns)'].values[0]), 'REMOTE', str(sv_input), 'LOCAL', str(sv_weight), 'REMOTE',  str(sv_output), 'NONE', '0', 'NONE', 'hybrid'))
             
