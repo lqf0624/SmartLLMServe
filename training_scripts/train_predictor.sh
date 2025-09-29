@@ -148,6 +148,7 @@ run_training() {
     # 运行训练
     cd "$PROJECT_ROOT"
 
+    # 运行训练，同时输出到终端和日志文件
     python3 training_scripts/train_predictor.py \
         --train_data "$TRAIN_DATA" \
         --val_data "$VAL_DATA" \

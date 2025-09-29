@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
+import os
+import sys
 from typing import Tuple, Optional, Dict, Any, List
 from enum import Enum
 import logging
@@ -495,13 +497,14 @@ class DLinearPredictor:
         data = data.sort_values('Timestamp').reset_index(drop=True)
 
         # 统一处理：确保总是有三个特征
-        if 'Concurrent_requests' in data.columns:
+        if 'concurrent_requests' in data.columns:
             # 时间序列数据：分钟级固定间隔，只使用并发量和token数量
             concurrent_requests = data['concurrent_requests'].values.astype(float)
             input_tokens = data['input_toks'].values.astype(float)
             output_tokens = data['output_toks'].values.astype(float)
         else:
             # 原始数据格式：假设并发量为1
+            logger.error("未正确加载并发量")
             concurrent_requests = np.ones(len(data)).astype(float)
             input_tokens = data['input_toks'].values.astype(float)
             output_tokens = data['output_toks'].values.astype(float)
@@ -754,8 +757,17 @@ class DLinearPredictor:
         last_update_time = start_time
         update_interval = 2.0  # 每2秒更新一次进度条
 
-        # 创建控制台和进度条
-        console = Console()
+        # 创建控制台和进度条 - 尝试输出到终端
+        try:
+            # 尝试直接输出到终端
+            if sys.stdout.isatty():
+                console = Console()
+            else:
+                # 如果不是终端输出，使用标准输出
+                console = Console(file=sys.stdout)
+        except:
+            # 如果失败，使用标准输出
+            console = Console(file=sys.stdout)
 
         # 创建美观的进度条
         progress = Progress(
