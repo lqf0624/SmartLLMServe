@@ -22,7 +22,7 @@ import sys
 from typing import Tuple, Optional, Dict, Any, List
 from enum import Enum
 import logging
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 import warnings
 import time
 from tqdm import tqdm
@@ -319,7 +319,7 @@ class DLinearPredictor:
         self.criterion = nn.MSELoss()
 
         # 数据标准化器
-        self.scaler = StandardScaler()
+        self.scaler = RobustScaler()
 
         # 训练历史
         self.training_history = {
@@ -432,18 +432,18 @@ class DLinearPredictor:
         targets = np.array(targets)
 
 
-        # 使用StandardScaler进行标准化
+        # 使用RobustardScaler进行标准化
         if len(sequences) > 0:
-            # 保存StandardScaler用于反标准化
+            # 保存RobustardScaler用于反标准化
             self.scalers = []
 
-            # 重塑数据以便StandardScaler处理: (n_samples, n_features)
+            # 重塑数据以便RobustardScaler处理: (n_samples, n_features)
             sequences_reshaped = sequences.reshape(-1, sequences.shape[-1])
             targets_reshaped = targets.reshape(-1, targets.shape[-1])
 
             # 对每个特征分别进行标准化（通道独立）
             for feature_idx in range(sequences.shape[-1]):
-                scaler = StandardScaler()
+                scaler = RobustScaler()
                 sequences_reshaped[:, feature_idx] = scaler.fit_transform(sequences_reshaped[:, feature_idx].reshape(-1, 1)).ravel()
                 targets_reshaped[:, feature_idx] = scaler.transform(targets_reshaped[:, feature_idx].reshape(-1, 1)).ravel()
                 self.scalers.append(scaler)
@@ -727,7 +727,7 @@ class DLinearPredictor:
         if not hasattr(self, 'scalers') or len(self.scalers) == 0:
             # 使用训练数据初始化scalers
             X, y = self.prepare_data(train_data)
-            logger.info("初始化StandardScaler用于预测")
+            logger.info("初始化RobustScaler用于预测")
 
         # 训练历史
         history = {
@@ -989,7 +989,7 @@ class DLinearPredictor:
 
             sequences = np.array(sequences)
 
-        # 标准化（使用与训练相同的StandardScaler）
+        # 标准化（使用与训练相同的RobustardScaler）
         for feature_idx in range(sequences.shape[-1]):
             if hasattr(self, 'scalers') and feature_idx < len(self.scalers):
                 sequences[:, feature_idx] = self.scalers[feature_idx].transform(
@@ -1006,7 +1006,7 @@ class DLinearPredictor:
         # 反标准化
         prediction = prediction.squeeze(0).cpu().numpy()
 
-        # 使用StandardScaler进行反标准化
+        # 使用RobustardScaler进行反标准化
         if hasattr(self, 'scalers'):
             for feature_idx in range(prediction.shape[-1]):
                 if feature_idx < len(self.scalers):
@@ -1098,7 +1098,7 @@ class DLinearPredictor:
 
             sequences = np.array(sequences)
 
-        # 标准化（使用与训练相同的StandardScaler）
+        # 标准化（使用与训练相同的RobustardScaler）
         if hasattr(self, 'scalers') and len(self.scalers) >= 3:
             for feature_idx in range(3):
                 sequences[:, feature_idx] = self.scalers[feature_idx].transform(
@@ -1115,7 +1115,7 @@ class DLinearPredictor:
         # 反标准化
         prediction = prediction.squeeze(0).cpu().numpy()  # [pred_len, 3]
 
-        # 使用StandardScaler进行反标准化
+        # 使用RobustardScaler进行反标准化
         if hasattr(self, 'scalers') and len(self.scalers) >= 3:
             for feature_idx in range(3):
                 if feature_idx < len(self.scalers):
@@ -1371,7 +1371,7 @@ def test_dlinear_model():
 
 class NormalizedTimeSeriesDataset(torch.utils.data.Dataset):
     """
-    标准化的时间序列数据集，使用StandardScaler进行归一化
+    标准化的时间序列数据集，使用RobustardScaler进行归一化
     """
 
     def __init__(self, base_dataset, seq_len, device='cpu', predictor_instance=None):
@@ -1384,7 +1384,7 @@ class NormalizedTimeSeriesDataset(torch.utils.data.Dataset):
         self._fit_scalers()
 
     def _fit_scalers(self):
-        """拟合StandardScaler"""
+        """拟合RobustardScaler"""
         all_sequences = []
         all_targets = []
 
@@ -1398,12 +1398,12 @@ class NormalizedTimeSeriesDataset(torch.utils.data.Dataset):
             all_sequences = np.array(all_sequences)
             all_targets = np.array(all_targets)
 
-            # 为每个特征创建StandardScaler
+            # 为每个特征创建RobustardScaler
             self.scalers = []
 
             # 对输入序列进行标准化
             for feature_idx in range(all_sequences.shape[-1]):
-                scaler = StandardScaler()
+                scaler = RobustScaler()
                 seq_feature_data = all_sequences[:, :, feature_idx].reshape(-1, 1)
                 scaler.fit(seq_feature_data)
                 self.scalers.append(scaler)
