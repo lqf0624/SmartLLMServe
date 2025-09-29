@@ -38,8 +38,7 @@ SmartLLMServe builds upon the excellent [LLMServingSim](https://github.com/casys
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
 │   Data Sources  │───▶│  Workload Predictor│───▶│   RL Scheduler  │
 │                 │    │                  │    │                 │
-│ • ShareGPT      │    │ • Time Series     │    │ • State Space   │
-│ • BurstGPT      │    │   Forecasting     │    │   Design        │
+│ • BurstGPT      │    │ • Time Series     │    │ • State Space   │    │   Forecasting     │    │   Design        │
 │ • Custom Datasets│    │ • Resource Demand │    │ • Action Space  │
 │                 │    │   Prediction      │    │   Definition     │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
