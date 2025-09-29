@@ -56,7 +56,7 @@ class PredictorTrainer:
             'sequence_length': self.config.get('sequence_length', 50),
             'prediction_horizon': self.config.get('prediction_horizon', 10),
             'batch_size': self.config.get('batch_size', 64),
-            'learning_rate': self.config.get('learning_rate', 0.001),
+            'learning_rate': self.config.get('learning_rate', 0.005),
             'epochs': self.config.get('epochs', 100),
             'channels': self.config.get('channels', 3),
             'individual': self.config.get('individual', True),

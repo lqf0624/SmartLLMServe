@@ -15,7 +15,6 @@ DLinear官方实现 - 基于AAAI 2023论文
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from typing import Tuple, Optional, Dict, Any, List
@@ -23,6 +22,12 @@ from enum import Enum
 import logging
 from sklearn.preprocessing import StandardScaler
 import warnings
+import time
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.text import Text
 from .multi_task_loss import MultiTaskLoss
 
 warnings.filterwarnings('ignore')
@@ -342,7 +347,7 @@ class DLinearPredictor:
 
         # 列名映射：处理不同的数据集格式
         if 'Concurrent_requests' in data.columns:
-            # 时间序列数据格式 - 分钟级固定间隔，不需要时间间隔特征
+            # 时间序列数据格式 - 分钟级固定间隔
             if 'Request_tokens_sum' in data.columns and 'Response_tokens_sum' in data.columns:
                 data = data.rename(columns={
                     'Request_tokens_sum': 'input_toks',
@@ -358,32 +363,32 @@ class DLinearPredictor:
                 'Response tokens': 'output_toks'
             })
         elif 'input_toks' not in data.columns or 'output_toks' not in data.columns:
-            raise ValueError("数据必须包含'Request tokens'/'Response tokens'或'input_toks'/'output_toks'列")
+            raise ValueError("数据必须包含'Request tokens'/'Response tokens'或'Request_tokens_sum'/'Response_tokens_sum'或'input_toks'/'output_toks'列")
 
         # 按时间戳排序
         data = data.sort_values('Timestamp').reset_index(drop=True)
 
+        # 统一处理：确保总是有三个特征
         if 'Concurrent_requests' in data.columns:
             # 时间序列数据：分钟级固定间隔，只使用并发量和token数量
-            concurrent_requests = data['concurrent_requests'].values
-            input_tokens = data['input_toks'].values
-            output_tokens = data['output_toks'].values
-
-            # 目标值：下一个时间点的值
-            target_concurrent_requests = concurrent_requests[1:]  # 从第二个开始
-            target_input_tokens = input_tokens[1:]  # 从第二个开始
-            target_output_tokens = output_tokens[1:]  # 从第二个开始
+            concurrent_requests = data['concurrent_requests'].values.astype(float)
+            input_tokens = data['input_toks'].values.astype(float)
+            output_tokens = data['output_toks'].values.astype(float)
         else:
-            # 原始数据格式：计算时间间隔
-            time_intervals = np.diff(data['Timestamp'].values)
-            input_tokens = data['input_toks'].values[:-1]  # 除了最后一个
-            output_tokens = data['output_toks'].values[:-1]  # 除了最后一个
+            # 原始数据格式：假设并发量为1
+            concurrent_requests = np.ones(len(data)).astype(float)
+            input_tokens = data['input_toks'].values.astype(float)
+            output_tokens = data['output_toks'].values.astype(float)
 
-            # 目标值：下一个请求的时间间隔、输入token、输出token
-            target_time_intervals = time_intervals
-            target_input_tokens = data['input_toks'].values[1:]  # 从第二个开始
-            target_output_tokens = data['output_toks'].values[1:]  # 从第二个开始
-            target_concurrent_requests = np.ones_like(target_time_intervals)  # 原始数据默认并发量为1
+        # 调试信息
+        logger.info(f"数据准备 - concurrent_requests: [{concurrent_requests.min():.3f}, {concurrent_requests.max():.3f}], "
+                   f"input_tokens: [{input_tokens.min():.3f}, {input_tokens.max():.3f}], "
+                   f"output_tokens: [{output_tokens.min():.3f}, {output_tokens.max():.3f}]")
+
+        # 目标值：下一个时间点的值
+        target_concurrent_requests = concurrent_requests[1:]  # 从第二个开始
+        target_input_tokens = input_tokens[1:]  # 从第二个开始
+        target_output_tokens = output_tokens[1:]  # 从第二个开始
 
         # 创建输入序列（使用滑动窗口增加数据量）
         sequences = []
@@ -396,24 +401,12 @@ class DLinearPredictor:
             # 输入序列：[concurrent_requests, input_token, output_token]
             seq_features = []
             for j in range(i, i + self.seq_len):
-                if 'Concurrent_requests' in data.columns:
-                    # 时间序列数据：使用并发请求数
-                    seq_features.append([
-                        concurrent_requests[j],
-                        input_tokens[j],
-                        output_tokens[j]
-                    ])
-                else:
-                    # 原始数据：使用时间间隔
-                    if j == 0:
-                        time_interval = 0  # 第一个请求的时间间隔设为0
-                    else:
-                        time_interval = time_intervals[j-1]
-                    seq_features.append([
-                        time_interval,
-                        input_tokens[j],
-                        output_tokens[j]
-                    ])
+                # 时间序列数据：直接使用三项数据
+                seq_features.append([
+                    concurrent_requests[j],
+                    input_tokens[j],
+                    output_tokens[j]
+                ])
 
             sequences.append(seq_features)
 
@@ -421,64 +414,45 @@ class DLinearPredictor:
             target_seq = []
             for j in range(self.pred_len):
                 target_idx = i + self.seq_len + j
-                if 'Concurrent_requests' in data.columns:
-                    # 时间序列数据：使用并发请求数目标
-                    if target_idx < len(target_concurrent_requests):
-                        target_seq.append([
-                            target_concurrent_requests[target_idx],
-                            target_input_tokens[target_idx],
-                            target_output_tokens[target_idx]
-                        ])
-                    else:
-                        # 数据不足时用最后一个值填充
-                        target_seq.append([
-                            target_concurrent_requests[-1],
-                            target_input_tokens[-1],
-                            target_output_tokens[-1]
-                        ])
+                # 时间序列数据：使用三项数据目标
+                if target_idx < len(target_concurrent_requests):
+                    target_seq.append([
+                        target_concurrent_requests[target_idx],
+                        target_input_tokens[target_idx],
+                        target_output_tokens[target_idx]
+                    ])
                 else:
-                    # 原始数据：使用时间间隔目标
-                    if target_idx < len(target_time_intervals):
-                        target_seq.append([
-                            target_time_intervals[target_idx],
-                            target_input_tokens[target_idx],
-                            target_output_tokens[target_idx]
-                        ])
-                    else:
-                        # 数据不足时用最后一个值填充
-                        target_seq.append([
-                            target_time_intervals[-1],
-                            target_input_tokens[-1],
-                            target_output_tokens[-1]
-                        ])
+                    # 数据不足时用最后一个值填充
+                    target_seq.append([
+                        target_concurrent_requests[-1],
+                        target_input_tokens[-1],
+                        target_output_tokens[-1]
+                    ])
             targets.append(target_seq)
 
         sequences = np.array(sequences)
         targets = np.array(targets)
 
-        # 数据MinMax标准化
+
+        # 使用StandardScaler进行标准化
         if len(sequences) > 0:
-            # 保存标准化参数用于反标准化
-            self.norm_params = {'mins': [], 'maxs': []}
+            # 保存StandardScaler用于反标准化
+            self.scalers = []
 
-            # 对每个特征分别MinMax标准化
+            # 重塑数据以便StandardScaler处理: (n_samples, n_features)
+            sequences_reshaped = sequences.reshape(-1, sequences.shape[-1])
+            targets_reshaped = targets.reshape(-1, targets.shape[-1])
+
+            # 对每个特征分别进行标准化（通道独立）
             for feature_idx in range(sequences.shape[-1]):
-                min_val = sequences[:, :, feature_idx].min()
-                max_val = sequences[:, :, feature_idx].max()
-                self.norm_params['mins'].append(min_val)
-                self.norm_params['maxs'].append(max_val)
+                scaler = StandardScaler()
+                sequences_reshaped[:, feature_idx] = scaler.fit_transform(sequences_reshaped[:, feature_idx].reshape(-1, 1)).ravel()
+                targets_reshaped[:, feature_idx] = scaler.transform(targets_reshaped[:, feature_idx].reshape(-1, 1)).ravel()
+                self.scalers.append(scaler)
 
-                if max_val > min_val:
-                    sequences[:, :, feature_idx] = (sequences[:, :, feature_idx] - min_val) / (max_val - min_val)
-                else:
-                    sequences[:, :, feature_idx] = 0  # 所有值相同，设为0
-
-            # 对targets也进行标准化（使用与sequences相同的参数）
-            for feature_idx in range(targets.shape[-1]):
-                min_val = self.norm_params['mins'][feature_idx]
-                max_val = self.norm_params['maxs'][feature_idx]
-                if max_val > min_val:
-                    targets[:, :, feature_idx] = (targets[:, :, feature_idx] - min_val) / (max_val - min_val)
+            # 恢复原始形状
+            sequences = sequences_reshaped.reshape(sequences.shape)
+            targets = targets_reshaped.reshape(targets.shape)
 
         return torch.FloatTensor(sequences), torch.FloatTensor(targets)
 
@@ -520,27 +494,27 @@ class DLinearPredictor:
         # 按时间戳排序
         data = data.sort_values('Timestamp').reset_index(drop=True)
 
+        # 统一处理：确保总是有三个特征
         if 'Concurrent_requests' in data.columns:
             # 时间序列数据：分钟级固定间隔，只使用并发量和token数量
-            concurrent_requests = data['concurrent_requests'].values
-            input_tokens = data['input_toks'].values
-            output_tokens = data['output_toks'].values
-
-            # 目标值：下一个时间点的值
-            target_concurrent_requests = concurrent_requests[1:]  # 从第二个开始
-            target_input_tokens = input_tokens[1:]  # 从第二个开始
-            target_output_tokens = output_tokens[1:]  # 从第二个开始
+            concurrent_requests = data['concurrent_requests'].values.astype(float)
+            input_tokens = data['input_toks'].values.astype(float)
+            output_tokens = data['output_toks'].values.astype(float)
         else:
-            # 原始数据格式：计算时间间隔
-            time_intervals = np.diff(data['Timestamp'].values)
-            input_tokens = data['input_toks'].values[:-1]  # 除了最后一个
-            output_tokens = data['output_toks'].values[:-1]  # 除了最后一个
+            # 原始数据格式：假设并发量为1
+            concurrent_requests = np.ones(len(data)).astype(float)
+            input_tokens = data['input_toks'].values.astype(float)
+            output_tokens = data['output_toks'].values.astype(float)
 
-            # 目标值：下一个请求的时间间隔、输入token、输出token
-            target_time_intervals = time_intervals
-            target_input_tokens = data['input_toks'].values[1:]  # 从第二个开始
-            target_output_tokens = data['output_toks'].values[1:]  # 从第二个开始
-            target_concurrent_requests = np.ones_like(target_time_intervals)  # 原始数据默认并发量为1
+        # 调试信息
+        logger.info(f"批处理数据准备 - concurrent_requests: [{concurrent_requests.min():.3f}, {concurrent_requests.max():.3f}], "
+                   f"input_tokens: [{input_tokens.min():.3f}, {input_tokens.max():.3f}], "
+                   f"output_tokens: [{output_tokens.min():.3f}, {output_tokens.max():.3f}]")
+
+        # 目标值：下一个时间点的值
+        target_concurrent_requests = concurrent_requests[1:]  # 从第二个开始
+        target_input_tokens = input_tokens[1:]  # 从第二个开始
+        target_output_tokens = output_tokens[1:]  # 从第二个开始
 
         # 创建序列数据集
         class TimeSeriesDataset(torch.utils.data.Dataset):
@@ -556,7 +530,7 @@ class DLinearPredictor:
                 self.seq_len = input_size
 
             def __len__(self):
-                return max(0, len(self.input_tokens) - self.seq_len + 1)
+                return max(0, len(self.target_input_tokens) - self.seq_len + 1)
 
             def __getitem__(self, idx):
                 # 输入序列 - 分钟级固定间隔，只使用并发请求数和token数量
@@ -570,28 +544,19 @@ class DLinearPredictor:
 
                 # 目标序列 - 预测下一个时间点的并发请求数和token数量
                 target_features = [
-                    self.target_concurrent_requests[idx + self.seq_len - 1],
-                    self.target_input_tokens[idx + self.seq_len - 1],
-                    self.target_output_tokens[idx + self.seq_len - 1]
+                    self.target_concurrent_requests[idx],
+                    self.target_input_tokens[idx],
+                    self.target_output_tokens[idx]
                 ]
 
                 return torch.FloatTensor(seq_features), torch.FloatTensor(target_features)
 
-        # 创建数据集
-        if 'Concurrent_requests' in data.columns:
-            # 时间序列数据：使用并发请求数
-            dataset = TimeSeriesDataset(
-                input_tokens, output_tokens, concurrent_requests,
-                target_input_tokens, target_output_tokens, target_concurrent_requests,
-                self.seq_len
-            )
-        else:
-            # 原始数据格式：使用时间间隔
-            dataset = TimeSeriesDataset(
-                input_tokens, output_tokens, time_intervals,
-                target_input_tokens, target_output_tokens, target_time_intervals,
-                self.seq_len
-            )
+        # 创建数据集 - 统一使用三项特征
+        dataset = TimeSeriesDataset(
+            input_tokens, output_tokens, concurrent_requests,
+            target_input_tokens, target_output_tokens, target_concurrent_requests,
+            self.seq_len
+        )
 
         # 检查数据集大小
         dataset_size = len(dataset)
@@ -609,7 +574,7 @@ class DLinearPredictor:
 
         # 创建数据加载器
         dataloader = torch.utils.data.DataLoader(
-            dataset,
+            NormalizedTimeSeriesDataset(dataset, self.seq_len, self.device, self),
             batch_size=actual_batch_size,
             shuffle=True,
             num_workers=0,  # 避免多进程问题
@@ -759,6 +724,12 @@ class DLinearPredictor:
         train_loader = self.prepare_data_batch(train_data, batch_size)
         val_loader = self.prepare_data_batch(val_data, batch_size)
 
+        # 确保scalers已初始化（如果数据加载器没有设置的话）
+        if not hasattr(self, 'scalers') or len(self.scalers) == 0:
+            # 使用训练数据初始化scalers
+            X, y = self.prepare_data(train_data)
+            logger.info("初始化StandardScaler用于预测")
+
         # 训练历史
         history = {
             'train_loss': [],
@@ -771,171 +742,166 @@ class DLinearPredictor:
         best_model_state = None
 
         # 训练循环
-        from tqdm import tqdm
+        from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
+        from rich.console import Console
+        from rich.live import Live
+        from rich.table import Table
         import time
 
         # 计算总训练时间估算
         total_epochs = epochs
         start_time = time.time()
+        last_update_time = start_time
+        update_interval = 2.0  # 每2秒更新一次进度条
 
-        # 创建epoch进度条
-        epoch_pbar = tqdm(
-            range(total_epochs),
-            desc="Training",
-            unit="epoch",
-            dynamic_ncols=True,
-            bar_format="{l_bar}{bar:30}{r_bar}{bar:-10b}"
+        # 创建控制台和进度条
+        console = Console()
+
+        # 创建美观的进度条
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=None),
+            "[progress.percentage]{task.percentage:>3.0f}%",
+            "•",
+            TimeRemainingColumn(),
+            console=console,
+            transient=False
         )
 
-        for epoch in epoch_pbar:
-            self.model.train()
-            train_loss = 0.0
-            num_batches = 0
+        # 创建训练任务
+        train_task = progress.add_task("[bold blue]Training Model", total=total_epochs)
 
-            epoch_start_time = time.time()
+        # 使用进度条直接显示
+        with progress:
+            for epoch in range(total_epochs):
+                self.model.train()
+                train_loss = 0.0
+                num_batches = 0
 
-            # 训练阶段 - 简化batch进度条
-            train_batches = len(train_loader)
-            for batch_idx, (batch_X, batch_y) in enumerate(train_loader):
-                batch_X = batch_X.to(self.device)
-                batch_y = batch_y.to(self.device)
+                epoch_start_time = time.time()
 
-                # 前向传播
-                predictions = self.model(batch_X)  # [batch_size, output_size, 3]
+                # 训练阶段 - 静默训练
+                train_batches = len(train_loader)
+                for batch_idx, (batch_X, batch_y) in enumerate(train_loader):
+                    batch_X = batch_X.to(self.device)
+                    batch_y = batch_y.to(self.device)
 
-                # 调整输出格式以匹配损失函数期望
-                # 损失函数期望: [batch_size, seq_len, 3]
-                # 模型输出: [batch_size, output_size, 3]
-                # 我们只需要预测序列的最后一个时间步
-                batch_y_expanded = batch_y.unsqueeze(1).expand(-1, predictions.shape[1], -1)
+                    # 前向传播
+                    predictions = self.model(batch_X)  # [batch_size, output_size, 3]
 
-                # 计算标准MSE损失
-                loss = self.criterion(predictions, batch_y_expanded)
+                    # 调整输出格式以匹配损失函数期望
+                    batch_y_expanded = batch_y.unsqueeze(1).expand(-1, predictions.shape[1], -1)
 
-                # 反向传播
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                    # 计算标准MSE损失
+                    loss = self.criterion(predictions, batch_y_expanded)
 
-                train_loss += loss.item()
-                num_batches += 1
+                    # 反向传播
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
 
-                # 更新epoch进度条描述
-                if verbose and batch_idx % 50 == 0:  # 每50个batch更新一次
-                    current_loss = train_loss / num_batches
-                    progress = (batch_idx + 1) / train_batches * 100
-                    epoch_pbar.set_postfix({
-                        'train_loss': f'{current_loss:.4f}',
-                        'epoch_progress': f'{progress:.1f}%',
-                        'lr': f'{self.optimizer.param_groups[0]["lr"]:.2e}'
-                    })
+                    train_loss += loss.item()
+                    num_batches += 1
 
-            avg_train_loss = train_loss / num_batches
+                avg_train_loss = train_loss / num_batches
+                epoch_time = time.time() - epoch_start_time
 
-            epoch_time = time.time() - epoch_start_time
+                # 计算剩余时间估算
+                elapsed_time = time.time() - start_time
+                epochs_completed = epoch + 1
+                avg_epoch_time = elapsed_time / epochs_completed
+                remaining_epochs = total_epochs - epochs_completed
+                estimated_remaining_time = avg_epoch_time * remaining_epochs
 
-            # 计算剩余时间估算
-            elapsed_time = time.time() - start_time
-            epochs_completed = epoch + 1
-            avg_epoch_time = elapsed_time / epochs_completed
-            remaining_epochs = total_epochs - epochs_completed
-            estimated_remaining_time = avg_epoch_time * remaining_epochs
+                # 验证阶段 - 减少验证频率
+                avg_val_loss = avg_train_loss  # 默认使用训练损失作为验证损失
+                validation_interval = 5  # 每5个epoch验证一次
 
-            # 验证阶段 - 减少验证频率
-            avg_val_loss = avg_train_loss  # 默认使用训练损失作为验证损失
-            validation_interval = 5  # 每5个epoch验证一次
+                if (epoch + 1) % validation_interval == 0 or epoch == 0 or (epoch + 1) == total_epochs:
+                    self.model.eval()
+                    val_loss = 0.0
+                    val_batches = 0
 
-            if (epoch + 1) % validation_interval == 0 or epoch == 0 or (epoch + 1) == total_epochs:
-                self.model.eval()
-                val_loss = 0.0
-                val_batches = 0
+                    with torch.no_grad():
+                        for batch_X, batch_y in val_loader:
+                            batch_X = batch_X.to(self.device)
+                            batch_y = batch_y.to(self.device)
 
-                with torch.no_grad():
-                    for batch_X, batch_y in val_loader:
-                        batch_X = batch_X.to(self.device)
-                        batch_y = batch_y.to(self.device)
+                            predictions = self.model(batch_X)  # [batch_size, output_size, 3]
+                            batch_y_expanded = batch_y.unsqueeze(1).expand(-1, predictions.shape[1], -1)
+                            loss = self.criterion(predictions, batch_y_expanded)
+                            val_loss += loss.item()
+                            val_batches += 1
 
-                        predictions = self.model(batch_X)  # [batch_size, output_size, 3]
-                        batch_y_expanded = batch_y.unsqueeze(1).expand(-1, predictions.shape[1], -1)
-                        loss = self.criterion(predictions, batch_y_expanded)
-                        val_loss += loss.item()
-                        val_batches += 1
+                    avg_val_loss = val_loss / val_batches if val_batches > 0 else avg_train_loss
 
-                avg_val_loss = val_loss / val_batches if val_batches > 0 else avg_train_loss
+                # 记录历史
+                history['train_loss'].append(avg_train_loss)
+                history['val_loss'].append(avg_val_loss)
+                history['epoch_times'].append(epoch_time)
 
-                # 验证完成后更新进度条
-                if verbose:
-                    epoch_pbar.set_postfix({
-                        'train_loss': f'{avg_train_loss:.4f}',
-                        'val_loss': f'{avg_val_loss:.4f}',
-                        'best_val': f'{best_val_loss:.4f}',
-                        'ETA': f'{estimated_remaining_time/60:.1f}m'
-                    })
-            else:
-                # 非验证epoch，只显示训练损失
-                if verbose:
-                    epoch_pbar.set_postfix({
-                        'train_loss': f'{avg_train_loss:.4f}',
-                        'best_val': f'{best_val_loss:.4f}',
-                        'ETA': f'{estimated_remaining_time/60:.1f}m'
-                    })
+                # 只在验证epoch进行早停检查
+                is_validation_epoch = (epoch + 1) % validation_interval == 0 or epoch == 0 or (epoch + 1) == total_epochs
+                if is_validation_epoch:
+                    # 早停检查
+                    if avg_val_loss < best_val_loss:
+                        best_val_loss = avg_val_loss
+                        patience_counter = 0
+                        best_model_state = self.model.state_dict().copy()
+                    else:
+                        patience_counter += 1
 
-            # 记录历史
-            history['train_loss'].append(avg_train_loss)
-            history['val_loss'].append(avg_val_loss)
-            history['epoch_times'].append(epoch_time)
+                # 只在达到更新间隔或特定条件下更新进度条
+                current_time = time.time()
+                should_update = (
+                    current_time - last_update_time >= update_interval or  # 达到时间间隔
+                    epoch == 0 or  # 第一个epoch
+                    epoch == total_epochs - 1 or  # 最后一个epoch
+                    is_validation_epoch or  # 验证epoch
+                    epochs_completed % 10 == 0  # 每10个epoch
+                )
 
-            # 只在验证epoch进行早停检查
-            if (epoch + 1) % validation_interval == 0 or epoch == 0 or (epoch + 1) == total_epochs:
-                # 早停检查
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    patience_counter = 0
-                    best_model_state = self.model.state_dict().copy()
+                if verbose and should_update:
+                    # 更新进度条
+                    progress.update(train_task, advance=1,
+                                  description=f"[bold blue]Epoch {epoch+1}/{total_epochs} | "
+                                            f"Loss: {avg_train_loss:.4f} | "
+                                            f"Best: {best_val_loss:.4f}")
 
-                    # 更新进度条显示保存了最佳模型
+                    if is_validation_epoch:
+                        progress.update(train_task,
+                                      description=f"[bold blue]Epoch {epoch+1}/{total_epochs} | "
+                                                f"Train: {avg_train_loss:.4f} | "
+                                                f"Val: {avg_val_loss:.4f} | "
+                                                f"Best: {best_val_loss:.4f}")
+
+                    last_update_time = current_time
+
+                # 检查早停条件
+                if patience_counter >= patience:
                     if verbose:
-                        epoch_pbar.set_postfix({
-                            'train_loss': f'{avg_train_loss:.4f}',
-                            'val_loss': f'{avg_val_loss:.4f}',
-                            'best_val': f'{best_val_loss:.4f} ✓',
-                            'patience': f'{patience_counter}/{patience}',
-                            'ETA': f'{estimated_remaining_time/60:.1f}m'
-                        })
-                else:
-                    patience_counter += 1
-                    if verbose:
-                        epoch_pbar.set_postfix({
-                            'train_loss': f'{avg_train_loss:.4f}',
-                            'val_loss': f'{avg_val_loss:.4f}',
-                            'best_val': f'{best_val_loss:.4f}',
-                            'patience': f'{patience_counter}/{patience}',
-                            'ETA': f'{estimated_remaining_time/60:.1f}m'
-                        })
+                        logger.info(f"Early stopping at epoch {epoch+1} - patience limit reached")
+                        progress.update(train_task, description=f"[bold red]Early Stopped at Epoch {epoch+1}/{total_epochs}")
+                    break
 
-                    if patience_counter >= patience:
-                        if verbose:
-                            logger.info(f"Early stopping at epoch {epoch+1} - patience limit reached")
-                            epoch_pbar.set_description("Training completed (Early stopped)")
-                        break
+                # 每10个epoch记录一次日志
+                if verbose and epoch % 10 == 0:
+                    if (epoch + 1) % validation_interval == 0 or epoch == 0:
+                        logger.info(f"Epoch {epoch+1}/{total_epochs}: "
+                                   f"Train Loss: {avg_train_loss:.4f}, "
+                                   f"Val Loss: {avg_val_loss:.4f}, "
+                                   f"Best Val: {best_val_loss:.4f}, "
+                                   f"Time: {epoch_time:.1f}s")
+                    else:
+                        logger.info(f"Epoch {epoch+1}/{total_epochs}: "
+                                   f"Train Loss: {avg_train_loss:.4f}, "
+                                   f"Best Val: {best_val_loss:.4f}, "
+                                   f"Time: {epoch_time:.1f}s")
 
-            # 每10个epoch记录一次日志
-            if verbose and epoch % 10 == 0:
-                if (epoch + 1) % validation_interval == 0 or epoch == 0:
-                    logger.info(f"Epoch {epoch+1}/{total_epochs}: "
-                               f"Train Loss: {avg_train_loss:.4f}, "
-                               f"Val Loss: {avg_val_loss:.4f}, "
-                               f"Best Val: {best_val_loss:.4f}, "
-                               f"Time: {epoch_time:.1f}s")
-                else:
-                    logger.info(f"Epoch {epoch+1}/{total_epochs}: "
-                               f"Train Loss: {avg_train_loss:.4f}, "
-                               f"Best Val: {best_val_loss:.4f}, "
-                               f"Time: {epoch_time:.1f}s")
-
-        # 关闭进度条
+        # 完成进度条
         if verbose:
-            epoch_pbar.close()
+            progress.update(train_task, completed=total_epochs, description="[bold green]Training Completed!")
 
         # 恢复最佳模型
         if best_model_state is not None:
@@ -993,17 +959,21 @@ class DLinearPredictor:
             raise ValueError("数据必须包含Timestamp列")
 
         # 列名映射：处理不同的数据集格式
-        if 'Request tokens' in data.columns and 'Response tokens' in data.columns:
+        if 'Concurrent_requests' in data.columns:
+            # 时间序列数据格式 - 分钟级固定间隔
+            if 'Request_tokens_sum' in data.columns and 'Response_tokens_sum' in data.columns:
+                data = data.rename(columns={
+                    'Request_tokens_sum': 'input_toks',
+                    'Response_tokens_sum': 'output_toks',
+                    'Concurrent_requests': 'concurrent_requests'
+                })
+            else:
+                raise ValueError("时间序列数据必须包含'Request_tokens_sum'/'Response_tokens_sum'列")
+        elif 'Request tokens' in data.columns and 'Response tokens' in data.columns:
             # BurstGPT原始数据集格式
             data = data.rename(columns={
                 'Request tokens': 'input_toks',
                 'Response tokens': 'output_toks'
-            })
-        elif 'Request_tokens_sum' in data.columns and 'Response_tokens_sum' in data.columns:
-            # 分钟级聚合数据集格式
-            data = data.rename(columns={
-                'Request_tokens_sum': 'input_toks',
-                'Response_tokens_sum': 'output_toks'
             })
         elif 'input_toks' not in data.columns or 'output_toks' not in data.columns:
             raise ValueError("数据必须包含'Request tokens'/'Response tokens'或'Request_tokens_sum'/'Response_tokens_sum'或'input_toks'/'output_toks'列")
@@ -1018,38 +988,53 @@ class DLinearPredictor:
             padding_size = self.seq_len - len(data)
             sequences = np.zeros((self.seq_len, 3))
             if len(data) > 0:
-                # 计算时间间隔
-                time_intervals = np.diff(data['Timestamp'].values)
-                for i in range(len(data)):
-                    if i == 0:
-                        sequences[padding_size + i] = [0, data.iloc[i]['input_toks'], data.iloc[i]['output_toks']]
-                    else:
-                        sequences[padding_size + i] = [time_intervals[i-1], data.iloc[i]['input_toks'], data.iloc[i]['output_toks']]
+                if 'Concurrent_requests' in data.columns:
+                    # 时间序列数据格式：使用并发请求数
+                    for i in range(len(data)):
+                        sequences[padding_size + i] = [
+                            data.iloc[i]['concurrent_requests'],
+                            data.iloc[i]['input_toks'],
+                            data.iloc[i]['output_toks']
+                        ]
+                else:
+                    # 原始数据格式：计算时间间隔
+                    time_intervals = np.diff(data['Timestamp'].values).astype(float)
+                    for i in range(len(data)):
+                        if i == 0:
+                            sequences[padding_size + i] = [0, data.iloc[i]['input_toks'], data.iloc[i]['output_toks']]
+                        else:
+                            sequences[padding_size + i] = [time_intervals[i-1], data.iloc[i]['input_toks'], data.iloc[i]['output_toks']]
         else:
             # 使用最新的input_size个数据点
             recent_data = data.iloc[-self.seq_len:].copy()
             sequences = []
 
-            # 计算时间间隔
-            time_intervals = np.diff(recent_data['Timestamp'].values)
-
-            for i in range(len(recent_data)):
-                if i == 0:
-                    # 第一个请求，时间间隔为0
-                    sequences.append([0, recent_data.iloc[i]['input_toks'], recent_data.iloc[i]['output_toks']])
-                else:
-                    sequences.append([time_intervals[i-1], recent_data.iloc[i]['input_toks'], recent_data.iloc[i]['output_toks']])
+            if 'concurrent_requests' in recent_data.columns:
+                # 时间序列数据格式：使用并发请求数
+                for i in range(len(recent_data)):
+                    sequences.append([
+                        recent_data.iloc[i]['concurrent_requests'],
+                        recent_data.iloc[i]['input_toks'],
+                        recent_data.iloc[i]['output_toks']
+                    ])
+            else:
+                # 原始数据格式：计算时间间隔
+                time_intervals = np.diff(recent_data['Timestamp'].values).astype(float)
+                for i in range(len(recent_data)):
+                    if i == 0:
+                        # 第一个请求，时间间隔为0
+                        sequences.append([0, recent_data.iloc[i]['input_toks'], recent_data.iloc[i]['output_toks']])
+                    else:
+                        sequences.append([time_intervals[i-1], recent_data.iloc[i]['input_toks'], recent_data.iloc[i]['output_toks']])
 
             sequences = np.array(sequences)
 
-        # 标准化（使用与训练相同的方法）
+        # 标准化（使用与训练相同的StandardScaler）
         for feature_idx in range(sequences.shape[-1]):
-            mean_val = sequences[:, feature_idx].mean()
-            std_val = sequences[:, feature_idx].std()
-            if std_val > 0:
-                sequences[:, feature_idx] = (sequences[:, feature_idx] - mean_val) / std_val
-            else:
-                sequences[:, feature_idx] = sequences[:, feature_idx] - mean_val
+            if hasattr(self, 'scalers') and feature_idx < len(self.scalers):
+                sequences[:, feature_idx] = self.scalers[feature_idx].transform(
+                    sequences[:, feature_idx].reshape(-1, 1)
+                ).ravel()
 
         # 转换为张量
         input_tensor = torch.FloatTensor(sequences).unsqueeze(0).to(self.device)
@@ -1061,16 +1046,188 @@ class DLinearPredictor:
         # 反标准化
         prediction = prediction.squeeze(0).cpu().numpy()
 
-        # 如果有标准化参数，进行反标准化
-        if hasattr(self, 'norm_params') and self.norm_params:
+        # 使用StandardScaler进行反标准化
+        if hasattr(self, 'scalers'):
             for feature_idx in range(prediction.shape[-1]):
-                min_val = self.norm_params['mins'][feature_idx]
-                max_val = self.norm_params['maxs'][feature_idx]
-                if max_val > min_val:
-                    prediction[feature_idx] = prediction[feature_idx] * (max_val - min_val) + min_val
+                if feature_idx < len(self.scalers):
+                    prediction[feature_idx] = self.scalers[feature_idx].inverse_transform(
+                        prediction[feature_idx].reshape(-1, 1)
+                    ).ravel()[0]
 
-        # 返回预测结果
+        # 返回预测结果（归一化值，用于训练和验证）
         return torch.FloatTensor(prediction)
+
+    def predict_denormalized(self, data: pd.DataFrame, steps: Optional[int] = None) -> torch.Tensor:
+        """
+        进行预测并返回反归一化后的结果（用于实际应用和调度器）
+
+        Args:
+            data: 历史数据
+            steps: 预测步数，默认使用output_size
+
+        Returns:
+            torch.Tensor: 反归一化后的预测结果，形状为[steps, 3]，每行包含[并发请求数, 输入token, 输出token]
+        """
+        if steps is None:
+            steps = self.pred_len
+
+        self.model.eval()
+
+        # 确保数据有时间戳
+        if 'Timestamp' not in data.columns:
+            raise ValueError("数据必须包含Timestamp列")
+
+        # 列名映射：处理不同的数据集格式
+        if 'Concurrent_requests' in data.columns:
+            # 时间序列数据格式 - 分钟级固定间隔
+            if 'Request_tokens_sum' in data.columns and 'Response_tokens_sum' in data.columns:
+                data = data.rename(columns={
+                    'Request_tokens_sum': 'input_toks',
+                    'Response_tokens_sum': 'output_toks',
+                    'Concurrent_requests': 'concurrent_requests'
+                })
+            else:
+                raise ValueError("时间序列数据必须包含'Request_tokens_sum'/'Response_tokens_sum'列")
+        elif 'Request tokens' in data.columns and 'Response tokens' in data.columns:
+            # BurstGPT原始数据集格式
+            data = data.rename(columns={
+                'Request tokens': 'input_toks',
+                'Response tokens': 'output_toks'
+            })
+        elif 'input_toks' not in data.columns or 'output_toks' not in data.columns:
+            raise ValueError("数据必须包含'Request tokens'/'Response tokens'或'Request_tokens_sum'/'Response_tokens_sum'或'input_toks'/'output_toks'列")
+
+        # 按时间戳排序
+        data = data.sort_values('Timestamp').reset_index(drop=True)
+
+        # 准备输入序列 - 统一处理为三项特征
+        if len(data) < self.seq_len:
+            logger.warning(f"数据不足: {len(data)} < {self.seq_len}，将使用零填充")
+            # 使用零填充
+            padding_size = self.seq_len - len(data)
+            sequences = np.zeros((self.seq_len, 3))
+            if len(data) > 0:
+                # 统一使用三项特征
+                for i in range(len(data)):
+                    if 'concurrent_requests' in data.columns:
+                        concurrent_req = data.iloc[i]['concurrent_requests']
+                    else:
+                        concurrent_req = 1.0  # 默认并发量
+
+                    sequences[padding_size + i] = [
+                        concurrent_req,
+                        data.iloc[i]['input_toks'],
+                        data.iloc[i]['output_toks']
+                    ]
+        else:
+            # 使用最新的seq_len个数据点
+            recent_data = data.iloc[-self.seq_len:].copy()
+            sequences = []
+
+            for i in range(len(recent_data)):
+                if 'concurrent_requests' in recent_data.columns:
+                    concurrent_req = recent_data.iloc[i]['concurrent_requests']
+                else:
+                    concurrent_req = 1.0  # 默认并发量
+
+                sequences.append([
+                    concurrent_req,
+                    recent_data.iloc[i]['input_toks'],
+                    recent_data.iloc[i]['output_toks']
+                ])
+
+            sequences = np.array(sequences)
+
+        # 标准化（使用与训练相同的StandardScaler）
+        if hasattr(self, 'scalers') and len(self.scalers) >= 3:
+            for feature_idx in range(3):
+                sequences[:, feature_idx] = self.scalers[feature_idx].transform(
+                    sequences[:, feature_idx].reshape(-1, 1)
+                ).ravel()
+
+        # 转换为张量
+        input_tensor = torch.FloatTensor(sequences).unsqueeze(0).to(self.device)
+
+        # 预测
+        with torch.no_grad():
+            prediction = self.model(input_tensor)  # [1, pred_len, 3]
+
+        # 反标准化
+        prediction = prediction.squeeze(0).cpu().numpy()  # [pred_len, 3]
+
+        # 使用StandardScaler进行反标准化
+        if hasattr(self, 'scalers') and len(self.scalers) >= 3:
+            for feature_idx in range(3):
+                if feature_idx < len(self.scalers):
+                    # 对每个预测步的每个特征进行反标准化
+                    for step_idx in range(prediction.shape[0]):
+                        prediction[step_idx, feature_idx] = self.scalers[feature_idx].inverse_transform(
+                            prediction[step_idx, feature_idx].reshape(-1, 1)
+                        ).ravel()[0]
+
+        # 确保预测结果合理（非负值）
+        prediction = np.maximum(prediction, 0)
+
+        # 打印反归一化后的预测结果信息
+        logger.info(f"反归一化预测结果 - 形状: {prediction.shape}")
+        logger.info(f"反归一化范围 - 并发请求: [{prediction[:, 0].min():.1f}, {prediction[:, 0].max():.1f}]")
+        logger.info(f"反归一化范围 - 输入token: [{prediction[:, 1].min():.1f}, {prediction[:, 1].max():.1f}]")
+        logger.info(f"反归一化范围 - 输出token: [{prediction[:, 2].min():.1f}, {prediction[:, 2].max():.1f}]")
+
+        # 返回反归一化后的预测结果
+        return torch.FloatTensor(prediction)
+
+    def predict_with_details(self, data: pd.DataFrame, steps: Optional[int] = None) -> Dict[str, Any]:
+        """
+        进行预测并返回详细信息（使用反归一化结果）
+
+        Args:
+            data: 历史数据
+            steps: 预测步数，默认使用output_size
+
+        Returns:
+            Dict[str, Any]: 包含预测结果和详细信息的字典
+        """
+        # 获取反归一化后的预测结果
+        predictions = self.predict_denormalized(data, steps)
+
+        # 转换为numpy数组便于处理
+        pred_array = predictions.numpy()
+
+        # 计算统计信息
+        details = {
+            'predictions': predictions,
+            'shape': predictions.shape,
+            'statistics': {
+                'concurrent_requests': {
+                    'mean': float(pred_array[:, 0].mean()),
+                    'std': float(pred_array[:, 0].std()),
+                    'min': float(pred_array[:, 0].min()),
+                    'max': float(pred_array[:, 0].max())
+                },
+                'input_tokens': {
+                    'mean': float(pred_array[:, 1].mean()),
+                    'std': float(pred_array[:, 1].std()),
+                    'min': float(pred_array[:, 1].min()),
+                    'max': float(pred_array[:, 1].max())
+                },
+                'output_tokens': {
+                    'mean': float(pred_array[:, 2].mean()),
+                    'std': float(pred_array[:, 2].std()),
+                    'min': float(pred_array[:, 2].min()),
+                    'max': float(pred_array[:, 2].max())
+                }
+            },
+            'prediction_intervals': []
+        }
+
+        # 生成预测时间间隔（假设1分钟间隔）
+        last_timestamp = data['Timestamp'].iloc[-1]
+        for i in range(len(pred_array)):
+            pred_time = last_timestamp + pd.Timedelta(minutes=i+1)
+            details['prediction_intervals'].append(pred_time.strftime('%Y-%m-%d %H:%M:%S'))
+
+        return details
 
   
     def analyze_decomposition(self, data: pd.DataFrame) -> Dict[str, Any]:
@@ -1250,6 +1407,73 @@ def test_dlinear_model():
     print(f"  Decomposition analysis: {analysis}")
 
     return predictor
+
+
+class NormalizedTimeSeriesDataset(torch.utils.data.Dataset):
+    """
+    标准化的时间序列数据集，使用StandardScaler进行归一化
+    """
+
+    def __init__(self, base_dataset, seq_len, device='cpu', predictor_instance=None):
+        self.base_dataset = base_dataset
+        self.seq_len = seq_len
+        self.device = device
+        self.predictor_instance = predictor_instance
+
+        # 收集所有数据进行标准化
+        self._fit_scalers()
+
+    def _fit_scalers(self):
+        """拟合StandardScaler"""
+        all_sequences = []
+        all_targets = []
+
+        # 收集所有数据
+        for i in range(len(self.base_dataset)):
+            seq, target = self.base_dataset[i]
+            all_sequences.append(seq.numpy())
+            all_targets.append(target.numpy())
+
+        if len(all_sequences) > 0:
+            all_sequences = np.array(all_sequences)
+            all_targets = np.array(all_targets)
+
+            # 为每个特征创建StandardScaler
+            self.scalers = []
+
+            # 对输入序列进行标准化
+            for feature_idx in range(all_sequences.shape[-1]):
+                scaler = StandardScaler()
+                seq_feature_data = all_sequences[:, :, feature_idx].reshape(-1, 1)
+                scaler.fit(seq_feature_data)
+                self.scalers.append(scaler)
+
+            # 将scalers保存到预测器实例中，以便预测时使用
+            if self.predictor_instance is not None:
+                self.predictor_instance.scalers = self.scalers
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        seq, target = self.base_dataset[idx]
+
+        # 转换为numpy进行标准化
+        seq_np = seq.numpy()
+        target_np = target.numpy()
+
+        # 对每个特征进行标准化
+        for feature_idx in range(seq_np.shape[-1]):
+            if hasattr(self, 'scalers') and feature_idx < len(self.scalers):
+                seq_np[:, feature_idx] = self.scalers[feature_idx].transform(
+                    seq_np[:, feature_idx].reshape(-1, 1)
+                ).ravel()
+
+                target_np[feature_idx] = self.scalers[feature_idx].transform(
+                    target_np[feature_idx].reshape(-1, 1)
+                ).ravel()[0]
+
+        return torch.FloatTensor(seq_np), torch.FloatTensor(target_np)
 
 
 if __name__ == "__main__":
