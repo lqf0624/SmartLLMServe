@@ -147,7 +147,8 @@ class PredictorTrainer:
             validation_split=0.2,  # 从训练数据中分割验证集
             epochs=self.config.get('epochs', 100),
             batch_size=self.config.get('batch_size', 64),
-            patience=self.config.get('early_stopping_patience', 10)
+            patience=self.config.get('early_stopping_patience', 10),
+            verbose=True  # 启用Rich进度条显示
         )
 
         # 记录最终指标到wandb
