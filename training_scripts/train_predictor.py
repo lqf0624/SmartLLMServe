@@ -14,7 +14,7 @@ import torch
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple
 from datetime import datetime
 
 # 添加项目路径
@@ -22,7 +22,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from predictor.dlinear_model import DLinearPredictor
 import wandb
-from tqdm import tqdm
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -140,28 +139,48 @@ class PredictorTrainer:
         # 创建模型
         model = self.create_model()
 
-        # 训练模型（使用分批训练减少内存使用）
-        logger.info("开始分批训练...")
+        # 训练模型（使用新的简化训练方法）
+        logger.info("开始训练...")
+
         history = model.train_batch(
             train_data,
             validation_split=0.2,  # 从训练数据中分割验证集
             epochs=self.config.get('epochs', 100),
             batch_size=self.config.get('batch_size', 64),
             patience=self.config.get('early_stopping_patience', 10),
-            verbose=True  # 启用Rich进度条显示
+            verbose=True
         )
 
-        # 记录最终指标到wandb
+        # 记录指标到wandb
         if self.wandb_run:
             final_train_loss = history['train_loss'][-1]
             final_val_loss = history['val_loss'][-1]
             best_val_loss = min(history['val_loss'])
 
+            # 记录每个epoch的指标
+            for epoch, (train_loss, val_loss, val_mse, val_mae, lr) in enumerate(
+                zip(history['train_loss'], history['val_loss'],
+                    history['val_mse'], history['val_mae'],
+                    history['learning_rates'])
+            ):
+                wandb.log({
+                    'epoch': epoch,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'val_mse': val_mse,
+                    'val_mae': val_mae,
+                    'learning_rate': lr,
+                })
+
+            # 记录最终指标
             wandb.log({
                 'final_train_loss': final_train_loss,
                 'final_val_loss': final_val_loss,
                 'best_val_loss': best_val_loss,
-                'total_epochs': len(history['train_loss'])
+                'total_epochs': len(history['train_loss']),
+                'final_val_mse': history['val_mse'][-1],
+                'final_val_mae': history['val_mae'][-1],
+                'final_learning_rate': history['learning_rates'][-1],
             })
 
             # 保存模型到wandb
@@ -213,64 +232,110 @@ class PredictorTrainer:
         return metrics
 
     def _log_prediction_plots(self, predictions: torch.Tensor, val_data: pd.DataFrame):
-        """记录预测图表到wandb"""
+        """记录关键预测图表到wandb - 只在评估时生成少量核心图表"""
         try:
             import matplotlib.pyplot as plt
 
-            # 创建预测对比图
-            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-
-            # 图1: 损失曲线
-            if hasattr(self, 'history'):
-                axes[0, 0].plot(self.history['train_loss'], label='Train Loss')
-                axes[0, 0].plot(self.history['val_loss'], label='Val Loss')
-                axes[0, 0].set_title('Training Loss')
-                axes[0, 0].set_xlabel('Epoch')
-                axes[0, 0].set_ylabel('Loss')
-                axes[0, 0].legend()
-                axes[0, 0].grid(True)
-
-            # 图2: 预测值分布
+            # 处理预测值
             if isinstance(predictions, torch.Tensor):
                 pred_values = predictions.cpu().numpy()
             else:
                 pred_values = np.array(predictions)
 
-            axes[0, 1].hist(pred_values.flatten(), bins=20, alpha=0.7)
-            axes[0, 1].set_title('Prediction Values Distribution')
-            axes[0, 1].set_xlabel('Prediction Value')
-            axes[0, 1].set_ylabel('Frequency')
-            axes[0, 1].grid(True)
+            # 只创建1-2个核心图表
 
-            # 图3: 验证数据时间序列
-            axes[1, 0].plot(val_data['Concurrent_requests'].values[-100:])  # 最近100个点
-            axes[1, 0].set_title('Validation Data - Concurrent Requests (Last 100 points)')
-            axes[1, 0].set_xlabel('Time')
-            axes[1, 0].set_ylabel('Concurrent Requests')
-            axes[1, 0].grid(True)
+            # 图1: 训练vs验证损失对比（最重要的图表）
+            if hasattr(self, 'history') and 'train_loss' in self.history:
+                fig1, ax1 = plt.subplots(1, 1, figsize=(10, 6))
 
-            # 图4: 预测统计
-            axes[1, 1].bar(['Mean', 'Std', 'Min', 'Max'],
-                          [np.mean(pred_values), np.std(pred_values),
-                           np.min(pred_values), np.max(pred_values)])
-            axes[1, 1].set_title('Prediction Statistics')
-            axes[1, 1].set_ylabel('Value')
-            axes[1, 1].grid(True)
+                # 绘制训练和验证损失
+                epochs = range(len(self.history['train_loss']))
+                ax1.plot(epochs, self.history['train_loss'], label='Train Loss', linewidth=2, color='blue')
+                ax1.plot(epochs, self.history['val_loss'], label='Val Loss', linewidth=2, color='red')
 
-            # 保存图表
-            plt.tight_layout()
-            plt.savefig(self.output_dir / 'evaluation_summary.png', dpi=150, bbox_inches='tight')
+                # 标记最佳验证损失
+                best_epoch = np.argmin(self.history['val_loss'])
+                best_val_loss = self.history['val_loss'][best_epoch]
+                ax1.scatter(best_epoch, best_val_loss, color='red', s=100, zorder=5,
+                           label=f'Best: {best_val_loss:.4f}')
 
-            # 上传到wandb
-            if self.wandb_run:
-                wandb.log({
-                    'evaluation_summary': wandb.Image(str(self.output_dir / 'evaluation_summary.png'))
-                })
+                ax1.set_title('Training vs Validation Loss')
+                ax1.set_xlabel('Epoch')
+                ax1.set_ylabel('Loss')
+                ax1.legend()
+                ax1.grid(True, alpha=0.3)
 
-            plt.close()
+                plt.tight_layout()
+                plt.savefig(self.output_dir / 'loss_comparison.png', dpi=150, bbox_inches='tight')
+
+                # 上传到wandb
+                if self.wandb_run:
+                    wandb.log({
+                        'loss_comparison': wandb.Image(str(self.output_dir / 'loss_comparison.png'))
+                    })
+
+                plt.close()
+
+            # 图2: 预测质量概览（2×2布局）
+            if pred_values.size > 0:
+                fig2, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+                # 左上：验证MSE和MAE趋势
+                if hasattr(self, 'history') and 'val_mse' in self.history:
+                    epochs = range(len(self.history['val_mse']))
+                    axes[0, 0].plot(epochs, self.history['val_mse'], label='MSE', linewidth=2, color='red')
+                    axes[0, 0].plot(epochs, self.history['val_mae'], label='MAE', linewidth=2, color='orange')
+                    axes[0, 0].set_title('Validation Error Trends')
+                    axes[0, 0].set_xlabel('Epoch')
+                    axes[0, 0].set_ylabel('Error')
+                    axes[0, 0].legend()
+                    axes[0, 0].grid(True, alpha=0.3)
+
+                # 右上：学习率变化
+                if hasattr(self, 'history') and 'learning_rates' in self.history:
+                    epochs = range(len(self.history['learning_rates']))
+                    axes[0, 1].semilogy(epochs, self.history['learning_rates'], linewidth=2, color='green')
+                    axes[0, 1].set_title('Learning Rate Schedule')
+                    axes[0, 1].set_xlabel('Epoch')
+                    axes[0, 1].set_ylabel('Learning Rate (log scale)')
+                    axes[0, 1].grid(True, alpha=0.3)
+
+                # 左下：预测值分布
+                axes[1, 0].hist(pred_values.flatten(), bins=25, alpha=0.7, edgecolor='black')
+                axes[1, 0].set_title('Prediction Distribution')
+                axes[1, 0].set_xlabel('Prediction Value')
+                axes[1, 0].set_ylabel('Frequency')
+                axes[1, 0].grid(True, alpha=0.3)
+
+                # 右下：预测统计
+                stats_values = [np.mean(pred_values), np.std(pred_values),
+                               np.min(pred_values), np.max(pred_values)]
+                bars = axes[1, 1].bar(['Mean', 'Std', 'Min', 'Max'], stats_values,
+                                      color=['skyblue', 'lightcoral', 'lightgreen', 'gold'],
+                                      alpha=0.7, edgecolor='black')
+                axes[1, 1].set_title('Prediction Statistics')
+                axes[1, 1].set_ylabel('Value')
+                axes[1, 1].grid(True, alpha=0.3)
+
+                # 添加数值标签
+                for bar, value in zip(bars, stats_values):
+                    height = bar.get_height()
+                    axes[1, 1].text(bar.get_x() + bar.get_width()/2., height,
+                                   f'{value:.3f}', ha='center', va='bottom')
+
+                plt.tight_layout()
+                plt.savefig(self.output_dir / 'prediction_overview.png', dpi=150, bbox_inches='tight')
+
+                if self.wandb_run:
+                    wandb.log({
+                        'prediction_overview': wandb.Image(str(self.output_dir / 'prediction_overview.png'))
+                    })
+
+                plt.close()
 
         except Exception as e:
             logger.warning(f"Failed to create prediction plots: {e}")
+            logger.warning(f"Error details: {str(e)}")
 
     def save_config(self):
         """保存训练配置"""
