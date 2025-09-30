@@ -171,18 +171,32 @@ class DLinearPredictor:
         """准备数据"""
         logger.info("准备数据...")
 
-        # 提取特征
-        if 'concurrent_requests' in data.columns:
+        # 支持多种列名格式
+        if 'Concurrent_requests' in data.columns:
+            # 分钟级聚合数据的列名
+            concurrent_requests = data['Concurrent_requests'].values.astype(float)
+            input_tokens = data['Request_tokens_sum'].values.astype(float)
+            output_tokens = data['Response_tokens_sum'].values.astype(float)
+            logger.info(f"数据准备 - 分钟级聚合数据, concurrent_requests: [{concurrent_requests.min():.3f}, {concurrent_requests.max():.3f}], "
+                       f"input_tokens: [{input_tokens.min():.3f}, {input_tokens.max():.3f}], "
+                       f"output_tokens: [{output_tokens.min():.3f}, {output_tokens.max():.3f}]")
+        elif 'concurrent_requests' in data.columns:
+            # 原始数据的列名
             concurrent_requests = data['concurrent_requests'].values.astype(float)
             input_tokens = data['input_toks'].values.astype(float)
             output_tokens = data['output_toks'].values.astype(float)
-            logger.info(f"数据准备 - concurrent_requests: [{concurrent_requests.min():.3f}, {concurrent_requests.max():.3f}], "
+            logger.info(f"数据准备 - 原始数据, concurrent_requests: [{concurrent_requests.min():.3f}, {concurrent_requests.max():.3f}], "
                        f"input_tokens: [{input_tokens.min():.3f}, {input_tokens.max():.3f}], "
                        f"output_tokens: [{output_tokens.min():.3f}, {output_tokens.max():.3f}]")
         else:
+            # 没有并发量数据，使用默认值
             concurrent_requests = np.ones(len(data)).astype(float)
-            input_tokens = data['input_toks'].values.astype(float)
-            output_tokens = data['output_toks'].values.astype(float)
+            if 'Request_tokens_sum' in data.columns:
+                input_tokens = data['Request_tokens_sum'].values.astype(float)
+                output_tokens = data['Response_tokens_sum'].values.astype(float)
+            else:
+                input_tokens = data['input_toks'].values.astype(float)
+                output_tokens = data['output_toks'].values.astype(float)
             logger.info(f"数据准备 - 使用默认并发量=1, "
                        f"input_tokens: [{input_tokens.min():.3f}, {input_tokens.max():.3f}], "
                        f"output_tokens: [{output_tokens.min():.3f}, {output_tokens.max():.3f}]")
@@ -399,15 +413,30 @@ class DLinearPredictor:
             if len(data) > 0:
                 # 统一使用三项特征
                 for i in range(len(data)):
-                    if 'concurrent_requests' in data.columns:
+                    if 'Concurrent_requests' in data.columns:
+                        # 分钟级聚合数据
+                        concurrent_req = data.iloc[i]['Concurrent_requests']
+                        input_tok = data.iloc[i]['Request_tokens_sum']
+                        output_tok = data.iloc[i]['Response_tokens_sum']
+                    elif 'concurrent_requests' in data.columns:
+                        # 原始数据
                         concurrent_req = data.iloc[i]['concurrent_requests']
+                        input_tok = data.iloc[i]['input_toks']
+                        output_tok = data.iloc[i]['output_toks']
                     else:
-                        concurrent_req = 1.0  # 默认并发量
+                        # 默认值
+                        concurrent_req = 1.0
+                        if 'Request_tokens_sum' in data.columns:
+                            input_tok = data.iloc[i]['Request_tokens_sum']
+                            output_tok = data.iloc[i]['Response_tokens_sum']
+                        else:
+                            input_tok = data.iloc[i]['input_toks']
+                            output_tok = data.iloc[i]['output_toks']
 
                     sequences[padding_size + i] = [
                         concurrent_req,
-                        data.iloc[i]['input_toks'],
-                        data.iloc[i]['output_toks']
+                        input_tok,
+                        output_tok
                     ]
         else:
             # 使用最新的seq_len个数据点
@@ -415,15 +444,30 @@ class DLinearPredictor:
             sequences = []
 
             for i in range(len(recent_data)):
-                if 'concurrent_requests' in recent_data.columns:
+                if 'Concurrent_requests' in recent_data.columns:
+                    # 分钟级聚合数据
+                    concurrent_req = recent_data.iloc[i]['Concurrent_requests']
+                    input_tok = recent_data.iloc[i]['Request_tokens_sum']
+                    output_tok = recent_data.iloc[i]['Response_tokens_sum']
+                elif 'concurrent_requests' in recent_data.columns:
+                    # 原始数据
                     concurrent_req = recent_data.iloc[i]['concurrent_requests']
+                    input_tok = recent_data.iloc[i]['input_toks']
+                    output_tok = recent_data.iloc[i]['output_toks']
                 else:
-                    concurrent_req = 1.0  # 默认并发量
+                    # 默认值
+                    concurrent_req = 1.0
+                    if 'Request_tokens_sum' in recent_data.columns:
+                        input_tok = recent_data.iloc[i]['Request_tokens_sum']
+                        output_tok = recent_data.iloc[i]['Response_tokens_sum']
+                    else:
+                        input_tok = recent_data.iloc[i]['input_toks']
+                        output_tok = recent_data.iloc[i]['output_toks']
 
                 sequences.append([
                     concurrent_req,
-                    recent_data.iloc[i]['input_toks'],
-                    recent_data.iloc[i]['output_toks']
+                    input_tok,
+                    output_tok
                 ])
 
             sequences = np.array(sequences)
@@ -488,11 +532,34 @@ class DLinearPredictor:
             # 获取真实值
             actual_idx = idx + self.seq_len
             if actual_idx < len(val_data):
-                actual = [
-                    val_data.iloc[actual_idx]['concurrent_requests'] if 'concurrent_requests' in val_data.columns else 1.0,
-                    val_data.iloc[actual_idx]['input_toks'],
-                    val_data.iloc[actual_idx]['output_toks']
-                ]
+                if 'Concurrent_requests' in val_data.columns:
+                    # 分钟级聚合数据
+                    actual = [
+                        val_data.iloc[actual_idx]['Concurrent_requests'],
+                        val_data.iloc[actual_idx]['Request_tokens_sum'],
+                        val_data.iloc[actual_idx]['Response_tokens_sum']
+                    ]
+                elif 'concurrent_requests' in val_data.columns:
+                    # 原始数据
+                    actual = [
+                        val_data.iloc[actual_idx]['concurrent_requests'],
+                        val_data.iloc[actual_idx]['input_toks'],
+                        val_data.iloc[actual_idx]['output_toks']
+                    ]
+                else:
+                    # 默认值
+                    if 'Request_tokens_sum' in val_data.columns:
+                        actual = [
+                            1.0,
+                            val_data.iloc[actual_idx]['Request_tokens_sum'],
+                            val_data.iloc[actual_idx]['Response_tokens_sum']
+                        ]
+                    else:
+                        actual = [
+                            1.0,
+                            val_data.iloc[actual_idx]['input_toks'],
+                            val_data.iloc[actual_idx]['output_toks']
+                        ]
                 actuals.append(actual)
 
                 # 计算误差
