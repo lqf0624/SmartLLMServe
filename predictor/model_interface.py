@@ -32,8 +32,6 @@ class ModelType(Enum):
     """模型类型枚举"""
     LSTM = "lstm"
     DLINEAR = "dlinear"
-    TRANSFORMER = "transformer"
-    GRU = "gru"
     CNN = "cnn"
     PROPHET = "prophet"
     CUSTOM = "custom"  # 自定义模型
