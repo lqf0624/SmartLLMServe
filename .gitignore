@@ -6,3 +6,46 @@ CLAUDE.md
 # Ignore python cache
 *.pyc
 __pycache__/
+output/
+.claude
+PAPER_REMINDER.md
+astra-sim/
+llm-profile/
+dataset/
+
+# LaTeX compilation files
+*.aux
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.fff
+*.ttt
+*.fff
+*.gz
+*.pdf
+*.dvi
+*.ps
+*.eps
+*.backup
+*.bak
+
+# LaTeX build directories
+build/
+tmp/
+.cache/
+
+# LaTeX editor files
+*.swp
+*.swo
+*~
+
+# BibTeX files
+*.blg
+*.bbl
