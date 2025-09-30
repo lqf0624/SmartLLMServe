@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import RobustScaler
+from tqdm import tqdm
 import logging
 from typing import Dict, Any, Optional, Tuple, List
 import time
@@ -206,10 +207,12 @@ class DLinearPredictor:
         target_input_tokens = input_tokens[1:]  # 从第二个开始
         target_output_tokens = output_tokens[1:]  # 从第二个开始
 
-        # 标准化
+        # 标准化 - 对特征和目标值都进行归一化
         self.scalers = []
         features_to_scale = [concurrent_requests, input_tokens, output_tokens]
+        target_features_to_scale = [target_concurrent_requests, target_input_tokens, target_output_tokens]
         scaled_features = []
+        scaled_target_features = []
 
         for feature in features_to_scale:
             scaler = RobustScaler()
@@ -217,7 +220,13 @@ class DLinearPredictor:
             scaled_features.append(scaled_feature)
             self.scalers.append(scaler)
 
+        # 对目标值也进行归一化
+        for i, target_feature in enumerate(target_features_to_scale):
+            scaled_target_feature = self.scalers[i].transform(target_feature.reshape(-1, 1)).ravel()
+            scaled_target_features.append(scaled_target_feature)
+
         concurrent_requests, input_tokens, output_tokens = scaled_features
+        target_concurrent_requests, target_input_tokens, target_output_tokens = scaled_target_features
 
         return (input_tokens, output_tokens, concurrent_requests,
                 target_input_tokens, target_output_tokens, target_concurrent_requests)
@@ -338,7 +347,10 @@ class DLinearPredictor:
 
         start_time = time.time()
 
-        for epoch in range(epochs):
+        # 创建epoch进度条
+        epoch_pbar = tqdm(range(epochs), desc="Training", disable=not verbose)
+
+        for epoch in epoch_pbar:
             epoch_start = time.time()
 
             # 训练
@@ -371,6 +383,21 @@ class DLinearPredictor:
 
             epoch_time = time.time() - epoch_start
 
+            # 更新进度条描述
+            if val_loader is not None:
+                epoch_pbar.set_postfix({
+                    'Train Loss': f'{train_loss:.4f}',
+                    'Val Loss': f'{val_loss:.4f}',
+                    'Val MSE': f'{val_mse:.4f}',
+                    'LR': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
+                })
+            else:
+                epoch_pbar.set_postfix({
+                    'Train Loss': f'{train_loss:.4f}',
+                    'LR': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
+                })
+
+            # 每10个epoch输出详细信息
             if verbose and (epoch + 1) % 10 == 0:
                 if val_loader is not None:
                     logger.info(f"Epoch {epoch+1}/{epochs}: "
@@ -390,6 +417,8 @@ class DLinearPredictor:
             if patience_counter >= patience:
                 logger.info(f"Early stopping at epoch {epoch+1}")
                 break
+
+        epoch_pbar.close()
 
         # 恢复最佳模型
         if 'best_model_state' in locals():
