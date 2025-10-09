@@ -220,19 +220,61 @@ class PredictorTrainer:
         else:
             pred_values = np.array(predictions)
 
+        # 获取真实值（最后三个数据点作为真实值）
+        if len(val_data) >= 3:
+            if 'Concurrent_requests' in val_data.columns:
+                # 分钟级聚合数据
+                true_values = np.array([
+                    val_data.iloc[-3]['Concurrent_requests'],
+                    val_data.iloc[-2]['Concurrent_requests'],
+                    val_data.iloc[-1]['Concurrent_requests']
+                ])
+            elif 'concurrent_requests' in val_data.columns:
+                # 原始数据
+                true_values = np.array([
+                    val_data.iloc[-3]['concurrent_requests'],
+                    val_data.iloc[-2]['concurrent_requests'],
+                    val_data.iloc[-1]['concurrent_requests']
+                ])
+            else:
+                true_values = np.array([1.0, 1.0, 1.0])  # 默认值
+
+            # 计算误差指标
+            mse = np.mean((pred_values - true_values) ** 2)
+            mae = np.mean(np.abs(pred_values - true_values))
+            rmse = np.sqrt(mse)
+
+            # 计算每个特征的误差
+            feature_errors = {}
+            feature_names = ['Concurrent_Requests', 'Input_Tokens', 'Output_Tokens']
+            for i, name in enumerate(feature_names):
+                feature_mse = (pred_values[i] - true_values[i]) ** 2
+                feature_mae = np.abs(pred_values[i] - true_values[i])
+                feature_errors[name] = {'mse': feature_mse, 'mae': feature_mae}
+        else:
+            mse = mae = rmse = 0.0
+            true_values = np.array([])
+            feature_errors = {}
+
         metrics = {
             'prediction_shape': pred_values.shape,
             'mean_prediction': np.mean(pred_values),
             'std_prediction': np.std(pred_values),
             'min_prediction': np.min(pred_values),
             'max_prediction': np.max(pred_values),
-            'validation_data_size': len(val_data)
+            'validation_data_size': len(val_data),
+            'mse': mse,
+            'mae': mae,
+            'rmse': rmse,
+            'feature_errors': feature_errors,
+            'true_values': true_values.tolist() if len(true_values) > 0 else [],
+            'predicted_values': pred_values.tolist()
         }
 
         return metrics
 
     def _log_prediction_plots(self, predictions: torch.Tensor, val_data: pd.DataFrame):
-        """记录关键预测图表到wandb - 只在评估时生成少量核心图表"""
+        """记录关键预测图表到wandb - 包含预测值vs真实值对比图"""
         try:
             import matplotlib.pyplot as plt
 
@@ -242,7 +284,26 @@ class PredictorTrainer:
             else:
                 pred_values = np.array(predictions)
 
-            # 只创建1-2个核心图表
+            # 获取真实值用于对比
+            if len(val_data) >= 3:
+                if 'Concurrent_requests' in val_data.columns:
+                    true_values = np.array([
+                        val_data.iloc[-3]['Concurrent_requests'],
+                        val_data.iloc[-2]['Concurrent_requests'],
+                        val_data.iloc[-1]['Concurrent_requests']
+                    ])
+                elif 'concurrent_requests' in val_data.columns:
+                    true_values = np.array([
+                        val_data.iloc[-3]['concurrent_requests'],
+                        val_data.iloc[-2]['concurrent_requests'],
+                        val_data.iloc[-1]['concurrent_requests']
+                    ])
+                else:
+                    true_values = np.array([1.0, 1.0, 1.0])
+            else:
+                true_values = np.array([])
+
+            # 创建多个核心图表
 
             # 图1: 训练vs验证损失对比（最重要的图表）
             if hasattr(self, 'history') and 'train_loss' in self.history:
@@ -276,9 +337,57 @@ class PredictorTrainer:
 
                 plt.close()
 
-            # 图2: 预测质量概览（2×2布局）
+            # 图2: 预测值vs真实值对比图（核心新增图表）
+            if len(true_values) > 0 and pred_values.size > 0:
+                fig2, ax2 = plt.subplots(1, 1, figsize=(10, 6))
+
+                # 创建x轴标签
+                feature_names = ['Concurrent\nRequests', 'Input\nTokens', 'Output\nTokens']
+                x_pos = np.arange(len(feature_names))
+
+                # 绘制预测值和真实值的对比
+                bar_width = 0.35
+                bars1 = ax2.bar(x_pos - bar_width/2, pred_values, bar_width,
+                               label='Predicted', alpha=0.8, color='skyblue', edgecolor='navy')
+                bars2 = ax2.bar(x_pos + bar_width/2, true_values, bar_width,
+                               label='Actual', alpha=0.8, color='lightcoral', edgecolor='darkred')
+
+                # 添加数值标签
+                for bars, values in [(bars1, pred_values), (bars2, true_values)]:
+                    for bar, value in zip(bars, values):
+                        height = bar.get_height()
+                        ax2.text(bar.get_x() + bar.get_width()/2., height,
+                               f'{value:.1f}', ha='center', va='bottom', fontsize=9)
+
+                # 设置图表属性
+                ax2.set_xlabel('Features')
+                ax2.set_ylabel('Values')
+                ax2.set_title('Predicted vs Actual Values Comparison')
+                ax2.set_xticks(x_pos)
+                ax2.set_xticklabels(feature_names)
+                ax2.legend()
+                ax2.grid(True, alpha=0.3, axis='y')
+
+                # 添加误差信息
+                mse = np.mean((pred_values - true_values) ** 2)
+                mae = np.mean(np.abs(pred_values - true_values))
+                ax2.text(0.02, 0.98, f'MSE: {mse:.4f}\nMAE: {mae:.4f}',
+                        transform=ax2.transAxes, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+                plt.tight_layout()
+                plt.savefig(self.output_dir / 'prediction_vs_actual.png', dpi=150, bbox_inches='tight')
+
+                if self.wandb_run:
+                    wandb.log({
+                        'prediction_vs_actual': wandb.Image(str(self.output_dir / 'prediction_vs_actual.png'))
+                    })
+
+                plt.close()
+
+            # 图3: 预测质量概览（2×2布局）
             if pred_values.size > 0:
-                fig2, axes = plt.subplots(2, 2, figsize=(12, 10))
+                fig3, axes = plt.subplots(2, 2, figsize=(12, 10))
 
                 # 左上：验证MSE和MAE趋势
                 if hasattr(self, 'history') and 'val_mse' in self.history:
@@ -366,7 +475,7 @@ def load_default_config() -> Dict:
         'hidden_size': 64,
         'num_layers': 2,
         'dropout': 0.1,
-        'early_stopping_patience': 10,
+        'early_stopping_patience': 25,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'output_dir': './training_output',
         'use_wandb': True,
@@ -404,7 +513,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=64, help='批大小')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='学习率')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
-    parser.add_argument('--early_stopping_patience', type=int, default=10, help='早停耐心值')
+    parser.add_argument('--early_stopping_patience', type=int, default=25, help='早停耐心值')
 
     # 设备参数
     parser.add_argument('--device', type=str, default='auto', help='设备 (auto/cpu/cuda)')
