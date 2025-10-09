@@ -27,7 +27,7 @@ class TimeSeriesDataset(Dataset):
 
     def __init__(self, input_tokens, output_tokens, concurrent_requests,
                  target_input_tokens, target_output_tokens, target_concurrent_requests,
-                 seq_len):
+                 seq_len, pred_len=1):
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.concurrent_requests = concurrent_requests
@@ -35,15 +35,16 @@ class TimeSeriesDataset(Dataset):
         self.target_output_tokens = target_output_tokens
         self.target_concurrent_requests = target_concurrent_requests
         self.seq_len = seq_len
+        self.pred_len = pred_len
 
-        # 计算可用的起始索引范围
-        self.max_start_idx = len(self.target_input_tokens) - self.seq_len
+        # 计算可用的起始索引范围，需要为pred_len个目标值留出空间
+        self.max_start_idx = len(self.target_input_tokens) - self.seq_len - self.pred_len + 1
         if self.max_start_idx <= 0:
             self.valid_indices = []
         else:
             self.valid_indices = list(range(self.max_start_idx))
 
-        logger.info(f"时间序列数据集: 可用序列数={len(self.valid_indices)}, 序列长度={self.seq_len}")
+        logger.info(f"时间序列数据集: 可用序列数={len(self.valid_indices)}, 序列长度={self.seq_len}, 预测长度={self.pred_len}")
 
     def __len__(self):
         return len(self.valid_indices)
@@ -71,23 +72,31 @@ class TimeSeriesDataset(Dataset):
                     self.output_tokens[-1]
                 ])
 
-        # 目标序列 - 预测下一个时间点的值
-        target_idx = start_idx + self.seq_len
-        if target_idx < len(self.target_concurrent_requests):
-            target_features = [
-                self.target_concurrent_requests[target_idx],
-                self.target_input_tokens[target_idx],
-                self.target_output_tokens[target_idx]
-            ]
-        else:
-            # 边界情况，使用最后一个目标值
-            target_features = [
-                self.target_concurrent_requests[-1],
-                self.target_input_tokens[-1],
-                self.target_output_tokens[-1]
-            ]
+        # 目标序列 - 预测pred_len个时间点的值，形状为[channels, pred_len]
+        target_concurrent = []
+        target_input = []
+        target_output = []
 
-        return torch.FloatTensor(seq_features), torch.FloatTensor(target_features)
+        for t in range(self.pred_len):
+            target_idx = start_idx + self.seq_len + t
+            if target_idx < len(self.target_concurrent_requests):
+                target_concurrent.append(self.target_concurrent_requests[target_idx])
+                target_input.append(self.target_input_tokens[target_idx])
+                target_output.append(self.target_output_tokens[target_idx])
+            else:
+                # 边界情况，使用最后一个目标值
+                target_concurrent.append(self.target_concurrent_requests[-1])
+                target_input.append(self.target_input_tokens[-1])
+                target_output.append(self.target_output_tokens[-1])
+
+        # 重塑为 [3, pred_len] 形状
+        target_features = torch.tensor([
+            target_concurrent,  # [pred_len]
+            target_input,       # [pred_len]
+            target_output       # [pred_len]
+        ], dtype=torch.float32)  # [3, pred_len]
+
+        return torch.FloatTensor(seq_features), target_features
 
 
 class DLinearPredictor:
@@ -139,32 +148,34 @@ class DLinearPredictor:
                 self.individual = individual
 
                 if individual:
-                    # 通道独立的线性层 - 预测单个时间步
+                    # 通道独立的线性层 - 预测多个时间步
                     self.Linear = nn.ModuleList()
                     for i in range(channels):
-                        self.Linear.append(nn.Linear(seq_len, 1))  # 预测1个时间步
+                        self.Linear.append(nn.Linear(seq_len, pred_len))  # 预测pred_len个时间步
                 else:
                     # 通道共享的线性层
-                    self.Linear = nn.Linear(seq_len, 1)  # 预测1个时间步
+                    self.Linear = nn.Linear(seq_len, pred_len)  # 预测pred_len个时间步
 
             def forward(self, x):
                 # x: [batch_size, seq_len, channels]
                 if self.individual:
                     out = []
                     for i in range(self.channels):
-                        # 每个通道独立预测下一个时间步
-                        pred = self.Linear[i](x[:, :, i])  # [batch_size, 1]
+                        # 每个通道独立预测pred_len个时间步
+                        pred = self.Linear[i](x[:, :, i])  # [batch_size, pred_len]
                         out.append(pred)
-                    out = torch.cat(out, dim=1)  # [batch_size, channels] - 下一个时间步的3个特征
+                    out = torch.stack(out, dim=2)  # [batch_size, pred_len, channels] - pred_len个时间步的3个特征
                 else:
                     # 共享权重，每个通道独立预测
                     out = []
                     for i in range(self.channels):
-                        pred = self.Linear(x[:, :, i])  # [batch_size, 1]
+                        pred = self.Linear(x[:, :, i])  # [batch_size, pred_len]
                         out.append(pred)
-                    out = torch.cat(out, dim=1)  # [batch_size, channels]
+                    out = torch.stack(out, dim=2)  # [batch_size, pred_len, channels]
 
-                return out  # [batch_size, channels]
+                # 重新排列为 [batch_size, channels, pred_len] 以便于处理
+                out = out.permute(0, 2, 1)  # [batch_size, channels, pred_len]
+                return out  # [batch_size, channels, pred_len]
 
         return DLinear(self.seq_len, self.pred_len, self.channels, self.individual)
 
@@ -239,7 +250,7 @@ class DLinearPredictor:
         dataset = TimeSeriesDataset(
             input_tokens, output_tokens, concurrent_requests,
             target_input_tokens, target_output_tokens, target_concurrent_requests,
-            self.seq_len
+            self.seq_len, self.pred_len
         )
 
         if len(dataset) == 0:
@@ -513,26 +524,32 @@ class DLinearPredictor:
 
         # 预测
         with torch.no_grad():
-            prediction = self.model(input_tensor)  # [1, 3]
+            prediction = self.model(input_tensor)  # [1, channels, pred_len]
 
         # 反标准化
-        prediction = prediction.squeeze(0).cpu().numpy()  # [3]
+        prediction = prediction.squeeze(0).cpu().numpy()  # [channels, pred_len]
 
         if hasattr(self, 'scalers') and self.scalers is not None and len(self.scalers) >= 3:
-            for feature_idx in range(3):
+            for feature_idx in range(3):  # 对每个特征通道进行反归一化
                 if feature_idx < len(self.scalers):
                     prediction[feature_idx] = self.scalers[feature_idx].inverse_transform(
                         prediction[feature_idx].reshape(-1, 1)
-                    ).ravel()[0]
+                    ).ravel()
 
         # 确保预测结果合理（非负值）
         prediction = np.maximum(prediction, 0)
 
-        logger.info(f"预测结果: 并发请求={prediction[0]:.1f}, "
-                   f"输入token={prediction[1]:.1f}, 输出token={prediction[2]:.1f}")
+        # 计算预测期间的平均值用于日志输出
+        mean_prediction = prediction.mean(axis=1)  # [channels]
+        logger.info(f"预测结果: 并发请求={mean_prediction[0]:.1f}, "
+                   f"输入token={mean_prediction[1]:.1f}, 输出token={mean_prediction[2]:.1f}")
 
-        # 返回反归一化后的预测结果
-        return torch.FloatTensor(prediction)
+        # 如果指定了steps且小于pred_len，只返回前steps个预测
+        if steps is not None and steps < self.pred_len:
+            prediction = prediction[:, :steps]  # [channels, steps]
+
+        # 返回反归一化后的预测结果 [1, channels, pred_len]
+        return torch.FloatTensor(prediction).unsqueeze(0)
 
     def create_prediction_comparison(self, train_data: pd.DataFrame, val_data: pd.DataFrame,
                                    num_samples: int = 100) -> Dict[str, Any]:

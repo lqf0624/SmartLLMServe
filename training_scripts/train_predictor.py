@@ -14,7 +14,7 @@ import torch
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any, Optional
 from datetime import datetime
 
 # 添加项目路径
@@ -188,18 +188,31 @@ class PredictorTrainer:
             if os.path.exists(model_path):
                 wandb.save(model_path)
 
+        # 保存模型引用以便在其他方法中使用
+        self.model = model
+
         logger.info("训练完成")
         return model, history
 
-    def evaluate(self, model: DLinearPredictor, val_data: pd.DataFrame) -> Dict:
+    def evaluate(self, model: DLinearPredictor, val_data: pd.DataFrame, history: Dict = None) -> Dict:
         """评估模型性能"""
         logger.info("开始评估")
 
-        # 进行预测
+        # 保存历史记录用于图表生成
+        if history:
+            self.history = history
+
+        # 创建完整的预测对比
+        prediction_comparison = self._create_prediction_comparison(model, val_data)
+
+        # 进行单步预测
         predictions = model.predict(val_data, steps=self.config.get('prediction_horizon', 10))
 
         # 计算各种指标
         metrics = self._calculate_metrics(predictions, val_data)
+
+        # 合并预测对比统计到指标中
+        metrics.update(prediction_comparison)
 
         # 记录到wandb
         if self.wandb_run:
@@ -207,8 +220,8 @@ class PredictorTrainer:
                 'eval_metrics': metrics,
             })
 
-            # 创建预测对比图表
-            self._log_prediction_plots(predictions, val_data)
+        # 创建预测对比图表（独立于wandb）
+        self._log_prediction_plots(predictions, val_data, prediction_comparison)
 
         return metrics
 
@@ -219,6 +232,14 @@ class PredictorTrainer:
             pred_values = predictions.cpu().numpy()
         else:
             pred_values = np.array(predictions)
+
+        # pred_values 形状应该是 [1, 3, pred_len]，我们需要计算平均预测值来与真实值比较
+        if len(pred_values.shape) == 3:  # [1, 3, pred_len]
+            # 计算时间维度上的平均预测值
+            pred_avg = pred_values.mean(axis=2).squeeze(0)  # [3]
+        else:
+            # 兼容旧格式
+            pred_avg = pred_values.flatten()[:3]  # [3]
 
         # 获取真实值（最后三个数据点作为真实值）
         if len(val_data) >= 3:
@@ -240,16 +261,16 @@ class PredictorTrainer:
                 true_values = np.array([1.0, 1.0, 1.0])  # 默认值
 
             # 计算误差指标
-            mse = np.mean((pred_values - true_values) ** 2)
-            mae = np.mean(np.abs(pred_values - true_values))
+            mse = np.mean((pred_avg - true_values) ** 2)
+            mae = np.mean(np.abs(pred_avg - true_values))
             rmse = np.sqrt(mse)
 
             # 计算每个特征的误差
             feature_errors = {}
             feature_names = ['Concurrent_Requests', 'Input_Tokens', 'Output_Tokens']
             for i, name in enumerate(feature_names):
-                feature_mse = (pred_values[i] - true_values[i]) ** 2
-                feature_mae = np.abs(pred_values[i] - true_values[i])
+                feature_mse = (pred_avg[i] - true_values[i]) ** 2
+                feature_mae = np.abs(pred_avg[i] - true_values[i])
                 feature_errors[name] = {'mse': feature_mse, 'mae': feature_mae}
         else:
             mse = mae = rmse = 0.0
@@ -258,22 +279,135 @@ class PredictorTrainer:
 
         metrics = {
             'prediction_shape': pred_values.shape,
-            'mean_prediction': np.mean(pred_values),
-            'std_prediction': np.std(pred_values),
-            'min_prediction': np.min(pred_values),
-            'max_prediction': np.max(pred_values),
+            'mean_prediction': np.mean(pred_avg),
+            'std_prediction': np.std(pred_avg),
+            'min_prediction': np.min(pred_avg),
+            'max_prediction': np.max(pred_avg),
             'validation_data_size': len(val_data),
             'mse': mse,
             'mae': mae,
             'rmse': rmse,
             'feature_errors': feature_errors,
             'true_values': true_values.tolist() if len(true_values) > 0 else [],
-            'predicted_values': pred_values.tolist()
+            'predicted_values': pred_avg.tolist()
         }
 
         return metrics
 
-    def _log_prediction_plots(self, predictions: torch.Tensor, val_data: pd.DataFrame):
+    def _create_prediction_comparison(self, model: DLinearPredictor, val_data: pd.DataFrame,
+                                   num_samples: int = 100) -> Dict[str, Any]:
+        """创建预测对比数据，用于生成预测值vs真实值曲线"""
+
+        # 确保有足够的数据
+        if len(val_data) <= model.seq_len:
+            logger.warning(f"验证数据不足: {len(val_data)} <= {model.seq_len}")
+            return {}
+
+        # 选择样本进行对比 - 使用滑动窗口方式
+        max_start_idx = len(val_data) - model.seq_len - 1  # -1确保有真实值可对比
+
+        if max_start_idx <= 0:
+            logger.warning(f"数据不足以进行预测对比: max_start_idx={max_start_idx}")
+            return {}
+
+        # 均匀选择样本点
+        if max_start_idx > num_samples:
+            step = max_start_idx // num_samples
+            sample_indices = list(range(0, max_start_idx, step))[:num_samples]
+        else:
+            sample_indices = list(range(max_start_idx))
+
+        predictions = []
+        actuals = []
+        errors = []
+
+        
+        for idx in sample_indices:
+            # 获取输入序列
+            input_data = val_data.iloc[idx:idx + model.seq_len]
+
+            # 预测未来pred_len个时间点
+            pred = model.predict(input_data, steps=model.pred_len)
+
+            # 展平为 [3 * pred_len] 用于存储
+            pred_flat = pred.squeeze(0).flatten().numpy()  # [3 * pred_len]
+            predictions.append(pred_flat)
+
+            # 获取真实值（预测目标的未来pred_len个时间点）
+            actual_start_idx = idx + model.seq_len
+            actual_end_idx = min(actual_start_idx + model.pred_len, len(val_data))
+
+            if actual_start_idx < len(val_data):
+                if 'Concurrent_requests' in val_data.columns:
+                    # 分钟级聚合数据
+                    actual_concurrent = val_data.iloc[actual_start_idx:actual_end_idx]['Concurrent_requests'].values
+                    actual_input = val_data.iloc[actual_start_idx:actual_end_idx]['Request_tokens_sum'].values
+                    actual_output = val_data.iloc[actual_start_idx:actual_end_idx]['Response_tokens_sum'].values
+                elif 'concurrent_requests' in val_data.columns:
+                    # 原始数据
+                    actual_concurrent = val_data.iloc[actual_start_idx:actual_end_idx]['concurrent_requests'].values
+                    actual_input = val_data.iloc[actual_start_idx:actual_end_idx]['input_toks'].values
+                    actual_output = val_data.iloc[actual_start_idx:actual_end_idx]['output_toks'].values
+                else:
+                    # 默认值
+                    if 'Request_tokens_sum' in val_data.columns:
+                        actual_concurrent = np.ones(model.pred_len)
+                        actual_input = val_data.iloc[actual_start_idx:actual_end_idx]['Request_tokens_sum'].values
+                        actual_output = val_data.iloc[actual_start_idx:actual_end_idx]['Response_tokens_sum'].values
+                    else:
+                        actual_concurrent = np.ones(model.pred_len)
+                        actual_input = np.zeros(model.pred_len)
+                        actual_output = np.zeros(model.pred_len)
+
+                # 确保所有数组长度一致
+                min_len = min(len(actual_concurrent), len(actual_input), len(actual_output), model.pred_len)
+                actual_concurrent = actual_concurrent[:min_len]
+                actual_input = actual_input[:min_len]
+                actual_output = actual_output[:min_len]
+
+                # 交错排列为 [feature1_time1, feature1_time2, ..., feature2_time1, feature2_time2, ...]
+                actual = []
+                for t in range(min_len):
+                    actual.extend([actual_concurrent[t], actual_input[t], actual_output[t]])
+
+                actuals.append(actual)
+
+                # 计算误差 - 修改为支持多时间步预测
+                # pred_flat 是展平的 [3 * pred_len]，actual 也是展平的 [3 * pred_len]
+                error = [abs(pred_flat[i] - actual[i]) for i in range(len(actual))]
+                errors.append(error)
+
+        if len(predictions) == 0:
+            logger.warning("没有生成任何预测对比数据")
+            return {}
+
+        predictions = np.array(predictions)
+        actuals = np.array(actuals)
+        errors = np.array(errors)
+
+        # 计算统计信息 - 修改为支持多时间步预测
+        errors = np.array(errors)
+        total_features = model.pred_len * 3  # pred_len个时间步 * 3个特征
+
+        stats = {
+            'comparison_predictions': predictions.tolist(),
+            'comparison_actuals': actuals.tolist(),
+            'comparison_errors': errors.tolist(),
+            'num_comparison_samples': len(predictions),
+            'mse_per_feature': [np.mean(errors[:, i]**2) for i in range(3)],  # 按特征类型聚合
+            'mae_per_feature': [np.mean(errors[:, i::3]) for i in range(3)],  # 每个特征类型在所有时间步上的平均误差
+            'rmse_per_feature': [np.sqrt(np.mean(errors[:, i::3]**2)) for i in range(3)],
+            'feature_names': ['concurrent_requests', 'input_tokens', 'output_tokens'],
+            'sample_indices': sample_indices,
+            'seq_len': model.seq_len,  # 添加实际序列长度
+            'pred_len': model.pred_len  # 添加预测长度
+        }
+
+  
+        return stats
+
+    def _log_prediction_plots(self, predictions: torch.Tensor, val_data: pd.DataFrame,
+                             prediction_comparison: Dict = None):
         """记录关键预测图表到wandb - 包含预测值vs真实值对比图"""
         try:
             import matplotlib.pyplot as plt
@@ -283,25 +417,6 @@ class PredictorTrainer:
                 pred_values = predictions.cpu().numpy()
             else:
                 pred_values = np.array(predictions)
-
-            # 获取真实值用于对比
-            if len(val_data) >= 3:
-                if 'Concurrent_requests' in val_data.columns:
-                    true_values = np.array([
-                        val_data.iloc[-3]['Concurrent_requests'],
-                        val_data.iloc[-2]['Concurrent_requests'],
-                        val_data.iloc[-1]['Concurrent_requests']
-                    ])
-                elif 'concurrent_requests' in val_data.columns:
-                    true_values = np.array([
-                        val_data.iloc[-3]['concurrent_requests'],
-                        val_data.iloc[-2]['concurrent_requests'],
-                        val_data.iloc[-1]['concurrent_requests']
-                    ])
-                else:
-                    true_values = np.array([1.0, 1.0, 1.0])
-            else:
-                true_values = np.array([])
 
             # 创建多个核心图表
 
@@ -337,57 +452,736 @@ class PredictorTrainer:
 
                 plt.close()
 
-            # 图2: 预测值vs真实值对比图（核心新增图表）
-            if len(true_values) > 0 and pred_values.size > 0:
-                fig2, ax2 = plt.subplots(1, 1, figsize=(10, 6))
+          # 图2: 真实值vs预测值时间序列对比图（核心新增图表）
+            seq_len = self.config.get('sequence_length', 120)
+            self._create_time_series_prediction_plot(predictions, val_data, prediction_comparison, seq_len)
 
-                # 创建x轴标签
-                feature_names = ['Concurrent\nRequests', 'Input\nTokens', 'Output\nTokens']
-                x_pos = np.arange(len(feature_names))
+            # 图3: 预测值vs真实值散点图（新增图表）
+            self._create_scatter_prediction_plot(predictions, val_data, prediction_comparison)
 
-                # 绘制预测值和真实值的对比
-                bar_width = 0.35
-                bars1 = ax2.bar(x_pos - bar_width/2, pred_values, bar_width,
-                               label='Predicted', alpha=0.8, color='skyblue', edgecolor='navy')
-                bars2 = ax2.bar(x_pos + bar_width/2, true_values, bar_width,
-                               label='Actual', alpha=0.8, color='lightcoral', edgecolor='darkred')
+            # 图4: 多样化预测对比图
+            if prediction_comparison:
+                self._create_diverse_prediction_plots(prediction_comparison, val_data)
 
-                # 添加数值标签
-                for bars, values in [(bars1, pred_values), (bars2, true_values)]:
-                    for bar, value in zip(bars, values):
-                        height = bar.get_height()
-                        ax2.text(bar.get_x() + bar.get_width()/2., height,
-                               f'{value:.1f}', ha='center', va='bottom', fontsize=9)
+            # 图5: 预测质量概览（2×2布局）
+            self._create_prediction_overview_plot(predictions)
 
-                # 设置图表属性
-                ax2.set_xlabel('Features')
-                ax2.set_ylabel('Values')
-                ax2.set_title('Predicted vs Actual Values Comparison')
-                ax2.set_xticks(x_pos)
-                ax2.set_xticklabels(feature_names)
-                ax2.legend()
-                ax2.grid(True, alpha=0.3, axis='y')
+        except Exception as e:
+            logger.warning(f"Failed to create prediction plots: {e}")
+            logger.warning(f"Error details: {str(e)}")
 
-                # 添加误差信息
-                mse = np.mean((pred_values - true_values) ** 2)
-                mae = np.mean(np.abs(pred_values - true_values))
-                ax2.text(0.02, 0.98, f'MSE: {mse:.4f}\nMAE: {mae:.4f}',
-                        transform=ax2.transAxes, verticalalignment='top',
-                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    def _create_time_series_prediction_plot(self, predictions: torch.Tensor, val_data: pd.DataFrame,
+                                         prediction_comparison: Dict = None, seq_len: int = 120):
+        """创建时间序列预测对比图 - 使用预测对比数据生成完整曲线"""
+        try:
+            import matplotlib.pyplot as plt
+
+            # 如果有预测对比数据，使用它来创建完整的预测vs真实值曲线
+            if prediction_comparison and 'comparison_predictions' in prediction_comparison:
+                self._create_detailed_time_series_plot(prediction_comparison, val_data)
+            else:
+                # 回退到简化版本
+                self._create_simple_time_series_plot(predictions, val_data)
+
+        except Exception as e:
+            logger.warning(f"Failed to create time series plot: {e}")
+
+    def _create_detailed_time_series_plot(self, prediction_comparison: Dict, val_data: pd.DataFrame, seq_len: int = 50):
+        """创建详细的时间序列对比图，显示历史数据序列和未来预测"""
+        try:
+            import matplotlib.pyplot as plt
+
+            predictions = np.array(prediction_comparison['comparison_predictions'])
+            actuals = np.array(prediction_comparison['comparison_actuals'])
+            sample_indices = prediction_comparison['sample_indices']
+            feature_names = prediction_comparison['feature_names']
+            pred_len = prediction_comparison.get('pred_len', 3)  # 获取预测长度，默认为3
+
+            # 动态获取实际的序列长度
+            actual_seq_len = prediction_comparison.get('seq_len', seq_len)
+            seq_len = actual_seq_len
+
+            # 创建多个对比图 - 选择有代表性的时间点
+            num_examples = min(4, len(sample_indices))  # 最多展示4个例子
+            example_indices = np.linspace(0, len(sample_indices)-1, num_examples, dtype=int)
+
+            # 确定数据列名
+            col_mapping = {
+                'concurrent_requests': 'Concurrent_requests' if 'Concurrent_requests' in val_data.columns else 'concurrent_requests',
+                'input_tokens': 'Request_tokens_sum' if 'Request_tokens_sum' in val_data.columns else 'input_toks',
+                'output_tokens': 'Response_tokens_sum' if 'Response_tokens_sum' in val_data.columns else 'output_toks'
+            }
+
+            # 创建多子图 - 每行一个例子，每列一个特征
+            fig, axes = plt.subplots(num_examples, 3, figsize=(18, 4 * num_examples))
+            if num_examples == 1:
+                axes = axes.reshape(1, -1)
+
+            for example_idx, sample_idx in enumerate(example_indices):
+                # sample_indices存储的是滑动窗口的起始索引
+                start_idx = sample_indices[sample_idx]
+                # 序列结束索引 = 起始索引 + seq_len - 1
+                actual_idx = start_idx + seq_len - 1
+
+                # 确保显示窗口：seq_len个历史点 + pred_len个预测点
+                end_idx = min(len(val_data), actual_idx + pred_len + 1)  # +pred_len+1为了显示预测段
+
+                for feature_idx, feature_name in enumerate(feature_names):
+                    true_col = col_mapping[feature_name]
+
+                    if true_col in val_data.columns:
+                        # 获取历史数据段 (从start_idx到start_idx+seq_len)
+                        history_data = val_data.iloc[start_idx:start_idx + seq_len][true_col].values
+
+                        # 获取未来真实值（确保有足够的数据）
+                        future_end_idx = min(actual_idx + pred_len + 1, len(val_data))
+                        future_data = val_data.iloc[actual_idx+1:future_end_idx][true_col].values
+
+                        # 时间轴 - 修复连接问题
+                        history_time = list(range(len(history_data)))
+                        # 预测时间应该紧接着历史数据的最后一个点
+                        pred_time = list(range(len(history_data) - 1, len(history_data) - 1 + pred_len))
+                        # 未来真实值时间轴也应该紧接着历史数据
+                        future_time = list(range(len(history_data) - 1, len(history_data) - 1 + len(future_data)))
+
+                        # 绘制历史真实值（蓝色）
+                        axes[example_idx, feature_idx].plot(history_time, history_data, 'b-',
+                                                           label='Actual', linewidth=2, alpha=0.8)
+
+                        # 绘制未来真实值（相同蓝色连接）
+                        if len(future_data) > 0:
+                            axes[example_idx, feature_idx].plot(future_time, future_data, 'b-',
+                                                               linewidth=2, alpha=0.8)
+
+                        # 绘制预测值 - 修正预测值提取方式
+                        # predictions的形状应该是 [num_samples, pred_len * num_features]
+                        feature_pred_start = feature_idx * pred_len
+                        feature_pred_end = feature_pred_start + pred_len
+
+                        if sample_idx < predictions.shape[0] and feature_pred_end <= predictions.shape[1]:
+                            pred_values = predictions[sample_idx, feature_pred_start:feature_pred_end]
+                        else:
+                            pred_values = np.zeros(pred_len)  # 使用默认值
+
+                        if len(pred_values) >= pred_len:
+                            axes[example_idx, feature_idx].plot(pred_time, pred_values, 'r--',
+                                                               label='Prediction', linewidth=2, alpha=0.8, marker='o', markersize=4)
+
+                        # 添加分割线 - 修正位置
+                        axes[example_idx, feature_idx].axvline(x=len(history_data)-1.5, color='orange',
+                                                              linestyle=':', alpha=0.7, label='Prediction Start')
+
+                        # 计算预测误差
+                        if len(future_data) > 0 and len(pred_values) >= pred_len:
+                            # 使用完整的预测长度和可用的未来数据
+                            actual_for_error = future_data[:min(len(future_data), pred_len)]
+                            pred_for_error = pred_values[:len(actual_for_error)]
+
+                            if len(actual_for_error) > 0:
+                                mse = np.mean((actual_for_error - pred_for_error) ** 2)
+                                mae = np.mean(np.abs(actual_for_error - pred_for_error))
+
+                                # 计算数据范围用于标准化误差显示
+                                all_data = np.concatenate([history_data, future_data])
+                                data_range = np.max(all_data) - np.min(all_data)
+                                if data_range > 0:
+                                    normalized_mae = mae / data_range
+                                else:
+                                    normalized_mae = 0
+                            else:
+                                mse = mae = normalized_mae = 0
+                        else:
+                            mse = mae = normalized_mae = 0
+
+                        # 设置标题和标签 - 根据特征类型选择不同的误差显示方式
+                        if feature_name == 'concurrent_requests':
+                            # 并发请求数显示具体误差值
+                            axes[example_idx, feature_idx].set_title(
+                                f'{feature_name.replace("_", " ").title()}\n'
+                                f'MAE: {mae:.2f}'
+                            )
+                        else:
+                            # Token相关特征显示标准化误差
+                            axes[example_idx, feature_idx].set_title(
+                                f'{feature_name.replace("_", " ").title()}'
+                            )
+
+                            # 在子图底部添加误差信息（小字体）
+                            if mae > 0:
+                                axes[example_idx, feature_idx].text(
+                                    0.5, 0.02, f'NMAE: {normalized_mae:.4f}',
+                                    transform=axes[example_idx, feature_idx].transAxes,
+                                    ha='center', va='bottom', fontsize=8, alpha=0.7
+                                )
+
+                        if example_idx == num_examples - 1:
+                            axes[example_idx, feature_idx].set_xlabel('Time Steps')
+                        if feature_idx == 0:
+                            axes[example_idx, feature_idx].set_ylabel(f'Example {example_idx + 1}\nValue')
+
+                        axes[example_idx, feature_idx].grid(True, alpha=0.3)
+
+                        # 只在第一个例子显示图例
+                        if example_idx == 0:
+                            axes[example_idx, feature_idx].legend(loc='upper right')
+
+            plt.tight_layout()
+            plt.savefig(self.output_dir / 'detailed_time_series_prediction.png', dpi=150, bbox_inches='tight')
+
+            if self.wandb_run:
+                wandb.log({
+                    'detailed_time_series_prediction': wandb.Image(str(self.output_dir / 'detailed_time_series_prediction.png'))
+                })
+
+            plt.close()
+            logger.info(f"详细时间序列预测图已生成 - 展示{num_examples}个例子，窗口大小{seq_len}，预测长度{pred_len}")
+
+        except Exception as e:
+            logger.warning(f"Failed to create detailed time series plot: {e}")
+
+    def _create_simple_time_series_plot(self, predictions: torch.Tensor, val_data: pd.DataFrame):
+        """创建简化版时间序列预测对比图"""
+        try:
+            import matplotlib.pyplot as plt
+
+            # 处理预测值
+            if isinstance(predictions, torch.Tensor):
+                pred_values = predictions.cpu().numpy()
+            else:
+                pred_values = np.array(predictions)
+
+            # 从验证数据中获取真实值的时间序列
+            if len(val_data) >= 50:  # 需要足够的数据点来展示时间序列
+                # 获取最后50个真实值用于对比
+                recent_data = val_data.tail(50)
+
+                # 确定列名
+                concurrent_col = 'Concurrent_requests' if 'Concurrent_requests' in val_data.columns else 'concurrent_requests'
+                input_token_col = 'Request_tokens_sum' if 'Request_tokens_sum' in val_data.columns else 'input_toks'
+                output_token_col = 'Response_tokens_sum' if 'Response_tokens_sum' in val_data.columns else 'output_toks'
+
+                # 创建时间序列图
+                fig, axes = plt.subplots(3, 1, figsize=(15, 12))
+
+                # 转换索引为时间戳或序号
+                time_points = range(len(recent_data))
+
+                # 子图1: 并发请求数对比
+                if concurrent_col in recent_data.columns:
+                    true_concurrent = recent_data[concurrent_col].values
+                    pred_concurrent = pred_values[0]  # 使用预测的第一个值作为未来的预测
+
+                    axes[0].plot(time_points, true_concurrent, 'b-', label='Actual', linewidth=2, alpha=0.8)
+                    # 在未来时间点显示预测值
+                    pred_time = list(time_points) + [max(time_points) + 1]
+                    pred_series = list(true_concurrent) + [pred_concurrent]
+                    axes[0].plot(pred_time, pred_series, 'r--', label='Predicted', linewidth=2, alpha=0.8)
+                    axes[0].axvline(x=max(time_points), color='gray', linestyle=':', alpha=0.7, label='Prediction Point')
+
+                    axes[0].set_title('Concurrent Requests: Actual vs Predicted')
+                    axes[0].set_ylabel('Requests')
+                    axes[0].legend()
+                    axes[0].grid(True, alpha=0.3)
+
+                # 子图2: 输入tokens对比
+                if input_token_col in recent_data.columns:
+                    true_input = recent_data[input_token_col].values
+                    pred_input = pred_values[1] if len(pred_values) > 1 else pred_values[0]
+
+                    axes[1].plot(time_points, true_input, 'g-', label='Actual', linewidth=2, alpha=0.8)
+                    pred_time = list(time_points) + [max(time_points) + 1]
+                    pred_series = list(true_input) + [pred_input]
+                    axes[1].plot(pred_time, pred_series, 'r--', label='Predicted', linewidth=2, alpha=0.8)
+                    axes[1].axvline(x=max(time_points), color='gray', linestyle=':', alpha=0.7, label='Prediction Point')
+
+                    axes[1].set_title('Input Tokens: Actual vs Predicted')
+                    axes[1].set_ylabel('Tokens')
+                    axes[1].legend()
+                    axes[1].grid(True, alpha=0.3)
+
+                # 子图3: 输出tokens对比
+                if output_token_col in recent_data.columns:
+                    true_output = recent_data[output_token_col].values
+                    pred_output = pred_values[2] if len(pred_values) > 2 else pred_values[0]
+
+                    axes[2].plot(time_points, true_output, 'm-', label='Actual', linewidth=2, alpha=0.8)
+                    pred_time = list(time_points) + [max(time_points) + 1]
+                    pred_series = list(true_output) + [pred_output]
+                    axes[2].plot(pred_time, pred_series, 'r--', label='Predicted', linewidth=2, alpha=0.8)
+                    axes[2].axvline(x=max(time_points), color='gray', linestyle=':', alpha=0.7, label='Prediction Point')
+
+                    axes[2].set_title('Output Tokens: Actual vs Predicted')
+                    axes[2].set_ylabel('Tokens')
+                    axes[2].set_xlabel('Time')
+                    axes[2].legend()
+                    axes[2].grid(True, alpha=0.3)
 
                 plt.tight_layout()
-                plt.savefig(self.output_dir / 'prediction_vs_actual.png', dpi=150, bbox_inches='tight')
+                plt.savefig(self.output_dir / 'simple_time_series_prediction.png', dpi=150, bbox_inches='tight')
 
                 if self.wandb_run:
                     wandb.log({
-                        'prediction_vs_actual': wandb.Image(str(self.output_dir / 'prediction_vs_actual.png'))
+                        'simple_time_series_prediction': wandb.Image(str(self.output_dir / 'simple_time_series_prediction.png'))
                     })
 
                 plt.close()
 
-            # 图3: 预测质量概览（2×2布局）
+        except Exception as e:
+            logger.warning(f"Failed to create simple time series plot: {e}")
+
+    def _create_scatter_prediction_plot(self, predictions: torch.Tensor, val_data: pd.DataFrame,
+                                     prediction_comparison: Dict = None):
+        """创建预测值vs真实值散点图"""
+        try:
+            import matplotlib.pyplot as plt
+
+            # 如果有预测对比数据，使用它来创建散点图
+            if prediction_comparison and 'comparison_predictions' in prediction_comparison:
+                self._create_detailed_scatter_plot(prediction_comparison)
+            else:
+                # 回退到简化版本
+                self._create_simple_scatter_plot(predictions, val_data)
+
+        except Exception as e:
+            logger.warning(f"Failed to create scatter plot: {e}")
+
+    def _create_detailed_scatter_plot(self, prediction_comparison: Dict):
+        """创建详细散点图，使用预测对比数据"""
+        try:
+            import matplotlib.pyplot as plt
+
+            predictions = np.array(prediction_comparison['comparison_predictions'])
+            actuals = np.array(prediction_comparison['comparison_actuals'])
+            feature_names = prediction_comparison['feature_names']
+            mse_per_feature = prediction_comparison['mse_per_feature']
+            mae_per_feature = prediction_comparison['mae_per_feature']
+            rmse_per_feature = prediction_comparison['rmse_per_feature']
+
+            # 创建2×2布局的散点图
+            fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+            axes = axes.flatten()
+
+            # 为每个特征创建散点图
+            # 注意：predictions和actuals的格式是 [pred_len*3]，按特征交错排列
+            # 即 [concurrent_t1, concurrent_t2, ..., input_t1, input_t2, ..., output_t1, output_t2, ...]
+            pred_len = len(predictions[0]) // 3  # 计算预测长度
+
+            for i, feature_name in enumerate(feature_names):
+                if i < len(axes):
+                    # 计算该特征在数组中的起始和结束索引
+                    start_idx = i * pred_len
+                    end_idx = (i + 1) * pred_len
+
+                    # 提取该特征所有时间步的数据
+                    true_vals = actuals[:, start_idx:end_idx].flatten()
+                    pred_vals = predictions[:, start_idx:end_idx].flatten()
+
+                    # 绘制散点图
+                    axes[i].scatter(true_vals, pred_vals, alpha=0.6, s=40, color='blue', label='Predictions')
+
+                    # 绘制y=x线（完美预测线）
+                    min_val = min(min(true_vals), min(pred_vals))
+                    max_val = max(max(true_vals), max(pred_vals))
+                    axes[i].plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='Perfect Prediction')
+
+                    # 计算R²
+                    ss_res = np.sum((true_vals - pred_vals) ** 2)
+                    ss_tot = np.sum((true_vals - np.mean(true_vals)) ** 2)
+                    r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+
+                    # 设置图表属性
+                    axes[i].set_xlabel('True Values')
+                    axes[i].set_ylabel('Predicted Values')
+                    axes[i].set_title(f'{feature_name.replace("_", " ").title()}\n'
+                                    f'R² = {r2:.4f}, MSE = {mse_per_feature[i]:.4f}')
+                    axes[i].legend()
+                    axes[i].grid(True, alpha=0.3)
+
+                    # 添加统计信息
+                    stats_text = (f'Points: {len(true_vals)}\n'
+                                f'Mean True: {np.mean(true_vals):.2f}\n'
+                                f'Mean Pred: {np.mean(pred_vals):.2f}\n'
+                                f'RMSE: {rmse_per_feature[i]:.4f}')
+                    axes[i].text(0.02, 0.98, stats_text, transform=axes[i].transAxes,
+                               verticalalignment='top', bbox=dict(boxstyle='round',
+                               facecolor='wheat', alpha=0.8), fontsize=9)
+
+            # 隐藏最后一个子图（如果只有3个特征）
+            if len(feature_names) < 4:
+                axes[3].axis('off')
+
+                # 在最后一个子图位置添加总体统计
+                overall_stats_text = "Overall Prediction Performance\n" + "="*30 + "\n"
+                for i, name in enumerate(feature_names):
+                    overall_stats_text += f"{name.replace('_', ' ').title()}:\n"
+                    overall_stats_text += f"  MSE: {mse_per_feature[i]:.4f}\n"
+                    overall_stats_text += f"  MAE: {mae_per_feature[i]:.4f}\n"
+                    overall_stats_text += f"  RMSE: {rmse_per_feature[i]:.4f}\n\n"
+
+                overall_stats_text += f"Total Samples: {len(predictions)}"
+
+                axes[3].text(0.1, 0.9, overall_stats_text, transform=axes[3].transAxes,
+                           verticalalignment='top', bbox=dict(boxstyle='round',
+                           facecolor='lightblue', alpha=0.8), fontsize=10,
+                           family='monospace')
+                axes[3].set_title('Overall Statistics')
+
+            plt.tight_layout()
+            plt.savefig(self.output_dir / 'detailed_scatter_prediction.png', dpi=150, bbox_inches='tight')
+
+            if self.wandb_run:
+                wandb.log({
+                    'detailed_scatter_prediction': wandb.Image(str(self.output_dir / 'detailed_scatter_prediction.png'))
+                })
+
+            plt.close()
+            logger.info("详细散点预测图已生成")
+
+        except Exception as e:
+            logger.warning(f"Failed to create detailed scatter plot: {e}")
+
+    def _create_simple_scatter_plot(self, predictions: torch.Tensor, val_data: pd.DataFrame):
+        """创建简化版散点图"""
+        try:
+            import matplotlib.pyplot as plt
+
+            # 处理预测值
+            if isinstance(predictions, torch.Tensor):
+                pred_values = predictions.cpu().numpy()
+            else:
+                pred_values = np.array(predictions)
+
+            # 获取真实值
+            if len(val_data) >= 10:  # 需要足够的数据点
+                recent_data = val_data.tail(10)
+
+                # 确定列名
+                concurrent_col = 'Concurrent_requests' if 'Concurrent_requests' in val_data.columns else 'concurrent_requests'
+                input_token_col = 'Request_tokens_sum' if 'Request_tokens_sum' in val_data.columns else 'input_toks'
+                output_token_col = 'Response_tokens_sum' if 'Response_tokens_sum' in val_data.columns else 'output_toks'
+
+                # 收集真实值和预测值
+                true_values = []
+                pred_values_extended = []
+
+                if concurrent_col in recent_data.columns:
+                    true_concurrent = recent_data[concurrent_col].values
+                    pred_concurrent = pred_values[0] if len(pred_values) > 0 else true_concurrent[-1]
+                    true_values.extend(true_concurrent)
+                    pred_values_extended.extend([pred_concurrent] * len(true_concurrent))
+
+                if input_token_col in recent_data.columns:
+                    true_input = recent_data[input_token_col].values
+                    pred_input = pred_values[1] if len(pred_values) > 1 else true_input[-1]
+                    true_values.extend(true_input)
+                    pred_values_extended.extend([pred_input] * len(true_input))
+
+                if output_token_col in recent_data.columns:
+                    true_output = recent_data[output_token_col].values
+                    pred_output = pred_values[2] if len(pred_values) > 2 else true_output[-1]
+                    true_values.extend(true_output)
+                    pred_values_extended.extend([pred_output] * len(true_output))
+
+                if len(true_values) > 0 and len(pred_values_extended) > 0:
+                    # 创建散点图
+                    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+
+                    # 绘制散点图
+                    ax.scatter(true_values, pred_values_extended, alpha=0.6, s=50, color='blue', label='Predictions')
+
+                    # 绘制y=x线（完美预测线）
+                    min_val = min(min(true_values), min(pred_values_extended))
+                    max_val = max(max(true_values), max(pred_values_extended))
+                    ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='Perfect Prediction')
+
+                    # 计算R²
+                    true_array = np.array(true_values)
+                    pred_array = np.array(pred_values_extended)
+                    ss_res = np.sum((true_array - pred_array) ** 2)
+                    ss_tot = np.sum((true_array - np.mean(true_array)) ** 2)
+                    r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+
+                    # 计算RMSE
+                    rmse = np.sqrt(np.mean((true_array - pred_array) ** 2))
+                    mae = np.mean(np.abs(true_array - pred_array))
+
+                    # 设置图表属性
+                    ax.set_xlabel('True Values')
+                    ax.set_ylabel('Predicted Values')
+                    ax.set_title(f'True vs Predicted Values\nR² = {r2:.4f}, RMSE = {rmse:.4f}, MAE = {mae:.4f}')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+
+                    # 添加统计信息框
+                    stats_text = f'Number of points: {len(true_values)}\nMean True: {np.mean(true_values):.2f}\nMean Pred: {np.mean(pred_array):.2f}'
+                    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, verticalalignment='top',
+                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+                    plt.tight_layout()
+                    plt.savefig(self.output_dir / 'simple_scatter_prediction.png', dpi=150, bbox_inches='tight')
+
+                    if self.wandb_run:
+                        wandb.log({
+                            'simple_scatter_prediction': wandb.Image(str(self.output_dir / 'simple_scatter_prediction.png'))
+                        })
+
+                    plt.close()
+
+        except Exception as e:
+            logger.warning(f"Failed to create simple scatter plot: {e}")
+
+    def _create_diverse_prediction_plots(self, prediction_comparison: Dict, val_data: pd.DataFrame):
+        """创建多样化的预测对比图"""
+        try:
+            import matplotlib.pyplot as plt
+
+            predictions = np.array(prediction_comparison['comparison_predictions'])
+            actuals = np.array(prediction_comparison['comparison_actuals'])
+            sample_indices = prediction_comparison['sample_indices']
+            feature_names = prediction_comparison['feature_names']
+
+            # 图1: 不同负载水平的预测表现
+            self._create_load_level_analysis(predictions, actuals, sample_indices, val_data)
+
+            # 图2: 预测误差分布分析
+            self._create_error_distribution_analysis(predictions, actuals, feature_names)
+
+            # 图3: 时间序列连续预测展示
+            self._create_continuous_prediction_series(predictions, actuals, sample_indices, val_data)
+
+        
+        except Exception as e:
+            logger.warning(f"Failed to create diverse prediction plots: {e}")
+
+    def _create_load_level_analysis(self, predictions: np.ndarray, actuals: np.ndarray,
+                                  sample_indices: list, val_data: pd.DataFrame):
+        """分析不同负载水平下的预测表现"""
+        try:
+            import matplotlib.pyplot as plt
+
+            # 根据并发请求数将样本分为不同负载级别
+            concurrent_requests = actuals[:, 0]
+
+            # 定义负载级别
+            low_load = concurrent_requests <= 10
+            medium_load = (concurrent_requests > 10) & (concurrent_requests <= 50)
+            high_load = concurrent_requests > 50
+
+            load_levels = [
+                ('Low Load (≤10)', low_load, 'lightblue'),
+                ('Medium Load (11-50)', medium_load, 'orange'),
+                ('High Load (>50)', high_load, 'red')
+            ]
+
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+            for feature_idx, feature_name in enumerate(['concurrent_requests', 'input_tokens', 'output_tokens']):
+                ax = axes[feature_idx]
+
+                for level_name, mask, color in load_levels:
+                    if np.any(mask):
+                        actual_vals = actuals[mask, feature_idx]
+                        pred_vals = predictions[mask, feature_idx]
+
+                        # 计算该级别的R²
+                        ss_res = np.sum((actual_vals - pred_vals) ** 2)
+                        ss_tot = np.sum((actual_vals - np.mean(actual_vals)) ** 2)
+                        r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+
+                        ax.scatter(actual_vals, pred_vals, alpha=0.6, s=40,
+                                 color=color, label=f'{level_name} (R²={r2:.3f})')
+
+                # 绘制完美预测线
+                min_val = np.min(actuals[:, feature_idx])
+                max_val = np.max(actuals[:, feature_idx])
+                ax.plot([min_val, max_val], [min_val, max_val], 'k--',
+                       linewidth=2, label='Perfect Prediction', alpha=0.8)
+
+                ax.set_xlabel('Actual Values')
+                ax.set_ylabel('Predicted Values')
+                ax.set_title(f'{feature_name.replace("_", " ").title()} - Load Level Analysis')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(self.output_dir / 'load_level_analysis.png', dpi=150, bbox_inches='tight')
+
+            if self.wandb_run:
+                wandb.log({
+                    'load_level_analysis': wandb.Image(str(self.output_dir / 'load_level_analysis.png'))
+                })
+
+            plt.close()
+
+        except Exception as e:
+            logger.warning(f"Failed to create load level analysis: {e}")
+
+    def _create_error_distribution_analysis(self, predictions: np.ndarray, actuals: np.ndarray,
+                                         feature_names: list):
+        """分析预测误差分布"""
+        try:
+            import matplotlib.pyplot as plt
+
+            # 计算绝对误差和相对误差
+            abs_errors = np.abs(predictions - actuals)
+            rel_errors = np.zeros_like(predictions)
+
+            # 计算相对误差（避免除零）
+            for i in range(actuals.shape[1]):
+                mask = actuals[:, i] > 0
+                rel_errors[mask, i] = abs_errors[mask, i] / actuals[mask, i] * 100
+
+            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+            # 第一行：绝对误差分布
+            for i, feature_name in enumerate(feature_names):
+                axes[0, i].hist(abs_errors[:, i], bins=30, alpha=0.7, color='skyblue', edgecolor='black')
+                axes[0, i].set_title(f'{feature_name.replace("_", " ").title()} - Absolute Error')
+                axes[0, i].set_xlabel('Absolute Error')
+                axes[0, i].set_ylabel('Frequency')
+                axes[0, i].grid(True, alpha=0.3)
+
+                # 添加统计信息
+                mean_error = np.mean(abs_errors[:, i])
+                median_error = np.median(abs_errors[:, i])
+                axes[0, i].axvline(mean_error, color='red', linestyle='--',
+                                  label=f'Mean: {mean_error:.2f}')
+                axes[0, i].axvline(median_error, color='orange', linestyle='--',
+                                  label=f'Median: {median_error:.2f}')
+                axes[0, i].legend()
+
+            # 第二行：相对误差分布
+            for i, feature_name in enumerate(feature_names):
+                valid_errors = rel_errors[:, i][rel_errors[:, i] < 200]  # 过滤极端值
+                axes[1, i].hist(valid_errors, bins=30, alpha=0.7, color='lightcoral', edgecolor='black')
+                axes[1, i].set_title(f'{feature_name.replace("_", " ").title()} - Relative Error (%)')
+                axes[1, i].set_xlabel('Relative Error (%)')
+                axes[1, i].set_ylabel('Frequency')
+                axes[1, i].grid(True, alpha=0.3)
+
+                # 添加统计信息
+                mean_rel_error = np.mean(valid_errors)
+                median_rel_error = np.median(valid_errors)
+                axes[1, i].axvline(mean_rel_error, color='red', linestyle='--',
+                                  label=f'Mean: {mean_rel_error:.1f}%')
+                axes[1, i].axvline(median_rel_error, color='orange', linestyle='--',
+                                  label=f'Median: {median_rel_error:.1f}%')
+                axes[1, i].legend()
+
+            plt.tight_layout()
+            plt.savefig(self.output_dir / 'error_distribution_analysis.png', dpi=150, bbox_inches='tight')
+
+            if self.wandb_run:
+                wandb.log({
+                    'error_distribution_analysis': wandb.Image(str(self.output_dir / 'error_distribution_analysis.png'))
+                })
+
+            plt.close()
+
+        except Exception as e:
+            logger.warning(f"Failed to create error distribution analysis: {e}")
+
+    def _create_continuous_prediction_series(self, predictions: np.ndarray, actuals: np.ndarray,
+                                           sample_indices: list, val_data: pd.DataFrame):
+        """创建连续时间序列预测展示"""
+        try:
+            import matplotlib.pyplot as plt
+
+            # 选择一个连续的时间段展示
+            start_sample = len(sample_indices) // 3  # 从中间开始
+            num_continuous = min(20, len(sample_indices) - start_sample)  # 连续20个预测点
+
+            if num_continuous < 5:
+                return
+
+            fig, axes = plt.subplots(3, 1, figsize=(16, 12))
+
+            # 确定数据列名
+            col_mapping = {
+                'concurrent_requests': 'Concurrent_requests' if 'Concurrent_requests' in val_data.columns else 'concurrent_requests',
+                'input_tokens': 'Request_tokens_sum' if 'Request_tokens_sum' in val_data.columns else 'input_toks',
+                'output_tokens': 'Response_tokens_sum' if 'Response_tokens_sum' in val_data.columns else 'output_toks'
+            }
+
+            feature_names = ['concurrent_requests', 'input_tokens', 'output_tokens']
+
+            for feature_idx, feature_name in enumerate(feature_names):
+                true_col = col_mapping[feature_name]
+
+                if true_col in val_data.columns:
+                    # 获取连续时间段的数据
+                    continuous_indices = sample_indices[start_sample:start_sample + num_continuous]
+
+                    # 获取对应的真实值（需要偏移1，因为预测的是下一个时间点）
+                    actual_values = []
+                    for idx in continuous_indices:
+                        actual_idx = idx + 1  # 预测目标的位置
+                        if actual_idx < len(val_data):
+                            actual_values.append(val_data.iloc[actual_idx][true_col])
+                        else:
+                            actual_values.append(val_data.iloc[-1][true_col])
+
+                    # 获取预测值 - 直接使用预测对比数据中的预测值
+                    # predictions是列表，每个元素是展平的 [3 * pred_len] 数组
+                    # 顺序: [pred_len个concurrent_requests, pred_len个input_tokens, pred_len个output_tokens]
+                    pred_len = self.model.pred_len
+                    pred_values = []
+                    for sample_idx in range(start_sample, start_sample + num_continuous):
+                        pred_flat = predictions[sample_idx]
+                        # 计算该特征在展平数组中的起始位置
+                        feature_start = feature_idx * pred_len
+                        # 取第一个预测时间步的值作为代表
+                        pred_values.append(pred_flat[feature_start])
+                    pred_values = np.array(pred_values)
+
+                    # 创建时间轴
+                    time_points = range(len(actual_values))
+
+                    # 绘制真实值和预测值
+                    axes[feature_idx].plot(time_points, actual_values, 'b-o',
+                                         label='Actual', linewidth=2, markersize=4, alpha=0.8)
+                    axes[feature_idx].plot(time_points, pred_values, 'r--s',
+                                         label='Predicted', linewidth=2, markersize=4, alpha=0.8)
+
+                    # 计算这个时间段的平均误差
+                    mae = np.mean(np.abs(np.array(actual_values) - pred_values))
+                    rmse = np.sqrt(np.mean((np.array(actual_values) - pred_values) ** 2))
+
+                    axes[feature_idx].set_title(
+                        f'{feature_name.replace("_", " ").title()} - Continuous Prediction\n'
+                        f'MAE: {mae:.2f}, RMSE: {rmse:.2f}'
+                    )
+                    axes[feature_idx].set_xlabel('Time Steps')
+                    axes[feature_idx].set_ylabel('Value')
+                    axes[feature_idx].legend()
+                    axes[feature_idx].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(self.output_dir / 'continuous_prediction_series.png', dpi=150, bbox_inches='tight')
+
+            if self.wandb_run:
+                wandb.log({
+                    'continuous_prediction_series': wandb.Image(str(self.output_dir / 'continuous_prediction_series.png'))
+                })
+
+            plt.close()
+
+        except Exception as e:
+            logger.warning(f"Failed to create continuous prediction series: {e}")
+
+    def _create_prediction_overview_plot(self, predictions: torch.Tensor):
+        """创建预测质量概览图"""
+        try:
+            import matplotlib.pyplot as plt
+
+            # 处理预测值
+            if isinstance(predictions, torch.Tensor):
+                pred_values = predictions.cpu().numpy()
+            else:
+                pred_values = np.array(predictions)
+
             if pred_values.size > 0:
-                fig3, axes = plt.subplots(2, 2, figsize=(12, 10))
+                fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
                 # 左上：验证MSE和MAE趋势
                 if hasattr(self, 'history') and 'val_mse' in self.history:
@@ -443,8 +1237,7 @@ class PredictorTrainer:
                 plt.close()
 
         except Exception as e:
-            logger.warning(f"Failed to create prediction plots: {e}")
-            logger.warning(f"Error details: {str(e)}")
+            logger.warning(f"Failed to create overview plot: {e}")
 
     def save_config(self):
         """保存训练配置"""
@@ -584,10 +1377,12 @@ def main():
 
         # 评估模型
         val_data = pd.read_csv(args.val_data)
-        metrics = trainer.evaluate(model, val_data)
+        metrics = trainer.evaluate(model, val_data, history)
 
         logger.info("训练和评估完成")
-        logger.info(f"最终指标: {metrics}")
+        # 只输出关键指标
+        key_metrics = {k: v for k, v in metrics.items() if 'loss' in k or 'mse' in k or 'mae' in k}
+        logger.info(f"关键指标: {key_metrics}")
 
     except Exception as e:
         logger.error(f"训练过程中出现错误: {e}")
