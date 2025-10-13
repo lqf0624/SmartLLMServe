@@ -105,6 +105,214 @@ class UniversalDataLoader:
         """Normalize BurstGPT CSV data to standard format."""
         normalized = pd.DataFrame()
 
+        # Check if this is minute-level aggregated data
+        if 'Request_tokens_sum' in data.columns and 'Response_tokens_sum' in data.columns:
+            return self._normalize_minute_level_data(data)
+
+        # Check for original BurstGPT format
+        if 'Request tokens' in data.columns and 'Response tokens' in data.columns:
+            return self._normalize_original_burstgpt_data(data)
+
+        raise ValueError("Unsupported CSV format. Expected columns for BurstGPT format.")
+
+    def _normalize_minute_level_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Normalize minute-level aggregated BurstGPT data using realistic token distribution."""
+        normalized = pd.DataFrame()
+
+        # Performance model limits
+        MAX_INPUT_TOKENS = 2048
+        MAX_OUTPUT_TOKENS = 2048
+
+        # Generate requests from minute-level data
+        requests = []
+        for idx, row in data.iterrows():
+            # Skip rows with no activity
+            if row['Concurrent_requests'] == 0 or row['Request_tokens_sum'] == 0:
+                continue
+
+            # Extract minute-level statistics
+            minute_concurrent = int(row['Concurrent_requests'])  # Total number of requests in this minute
+            total_input_tokens = int(row['Request_tokens_sum'])  # SUM of input tokens for all requests
+            total_output_tokens = int(row['Response_tokens_sum'])  # SUM of output tokens for all requests
+
+            # Calculate base average tokens per request
+            base_avg_input = total_input_tokens / minute_concurrent
+            base_avg_output = total_output_tokens / minute_concurrent
+
+            print(f"   处理分钟级数据: {minute_concurrent} 个请求")
+            print(f"   基础平均值: input={base_avg_input:.1f}, output={base_avg_output:.1f}")
+
+            # Generate realistic token distribution based on BurstGPT analysis
+            input_tokens_list = self._generate_realistic_token_distribution(
+                minute_concurrent, total_input_tokens, base_avg_input)
+            output_tokens_list = self._generate_realistic_token_distribution(
+                minute_concurrent, total_output_tokens, base_avg_output)
+
+            # Generate arrival times within the minute
+            # Convert minute timestamp to nanoseconds
+            base_timestamp_ns = int(row['Timestamp'] * 60 * 1e9)  # minutes to nanoseconds
+            minute_duration_ns = 60 * 1e9  # 60 seconds in nanoseconds
+
+            # Use uniform distribution for arrival times across the minute
+            arrival_positions = np.random.uniform(0, 1, minute_concurrent)
+            sorted_indices = np.argsort(arrival_positions)
+
+            # Generate requests
+            minute_requests = 0
+            for i in range(minute_concurrent):
+                request_idx = sorted_indices[i]
+                arrival_time_ns = base_timestamp_ns + int(arrival_positions[request_idx] * minute_duration_ns)
+
+                # Apply performance model limits
+                input_tokens = min(input_tokens_list[i], MAX_INPUT_TOKENS)
+                output_tokens = min(output_tokens_list[i], MAX_OUTPUT_TOKENS)
+
+                # Allow 0 tokens (as seen in real BurstGPT data)
+                input_tokens = max(0, int(input_tokens))
+                output_tokens = max(0, int(output_tokens))
+
+                # Only add request if it has at least some tokens
+                if input_tokens > 0 or output_tokens > 0:
+                    requests.append({
+                        'input_toks': input_tokens,
+                        'output_toks': output_tokens,
+                        'arrival_time_ns': arrival_time_ns,
+                        'model_type': 'meta-llama/Llama-3.1-8B-Instruct'
+                    })
+                    minute_requests += 1
+
+            # Verify token totals (approximately, allowing for performance model limits)
+            if minute_requests > 0:
+                actual_input_total = sum(req['input_toks'] for req in requests[-minute_requests:])
+                actual_output_total = sum(req['output_toks'] for req in requests[-minute_requests:])
+
+                print(f"   生成请求: {minute_requests} 个 (过滤了0-token请求)")
+                print(f"   Token验证: 原始input={total_input_tokens}, 实际input={actual_input_total}")
+                print(f"   Token验证: 原始output={total_output_tokens}, 实际output={actual_output_total}")
+
+        if not requests:
+            # If no requests found, generate minimal requests
+            return self._generate_minimal_requests(len(data))
+
+        normalized = pd.DataFrame(requests)
+
+        # Sort by arrival time
+        normalized = normalized.sort_values('arrival_time_ns').reset_index(drop=True)
+
+        # Detect burst patterns
+        normalized['burst_pattern'] = self._detect_burst_pattern(normalized['arrival_time_ns'])
+
+        return normalized
+
+    def _generate_realistic_token_distribution(self, num_requests: int, total_tokens: int, base_avg: float) -> List[float]:
+        """
+        Generate realistic token distribution based on BurstGPT analysis.
+
+        Key insights from BurstGPT data:
+        - High concurrency → lower average tokens per request
+        - Many 0-token requests in high-concurrency minutes
+        - Token distribution follows log-normal pattern for non-zero requests
+        """
+        if num_requests == 0:
+            return []
+
+        tokens = []
+        remaining_tokens = total_tokens
+
+        # Determine strategy based on concurrency level and average tokens
+        if base_avg < 50:
+            # Very high concurrency scenario (like 1250 requests/min with avg=62 tokens)
+            # Many 0-token requests, few with normal tokens
+            zero_token_ratio = 0.4  # 40% zero-token requests
+
+            for i in range(num_requests):
+                if i == num_requests - 1:
+                    # Last request gets remaining tokens
+                    tokens.append(max(0, remaining_tokens))
+                elif np.random.random() < zero_token_ratio and remaining_tokens > 0:
+                    # Zero-token request
+                    tokens.append(0)
+                else:
+                    # Small token request (log-normal distribution)
+                    generated = np.random.lognormal(3.5, 1.2)  # exp(3.5) ≈ 33 tokens avg
+                    generated = min(generated, 500)  # Cap at 500 for high concurrency
+                    allocated = min(generated, remaining_tokens // max(1, num_requests - i - 1))
+                    tokens.append(max(0, allocated))
+                    remaining_tokens -= allocated
+
+        elif base_avg < 200:
+            # Medium-high concurrency (like 111 requests/min with avg=629 tokens)
+            # Fewer zero-token requests, moderate token sizes
+            zero_token_ratio = 0.1  # 10% zero-token requests
+
+            for i in range(num_requests):
+                if i == num_requests - 1:
+                    tokens.append(max(0, remaining_tokens))
+                elif np.random.random() < zero_token_ratio and remaining_tokens > 10:
+                    tokens.append(0)
+                else:
+                    # Medium token request
+                    generated = np.random.lognormal(5.0, 1.4)  # exp(5.0) ≈ 148 tokens avg
+                    generated = min(generated, 1500)
+                    allocated = min(generated, remaining_tokens // max(1, num_requests - i - 1))
+                    tokens.append(max(0, allocated))
+                    remaining_tokens -= allocated
+
+        elif base_avg < 600:
+            # Medium concurrency (like 4 requests/min with avg=935 tokens)
+            # Almost no zero-token requests, larger token sizes
+            zero_token_ratio = 0.02  # 2% zero-token requests
+
+            for i in range(num_requests):
+                if i == num_requests - 1:
+                    tokens.append(max(0, remaining_tokens))
+                elif np.random.random() < zero_token_ratio and remaining_tokens > 50:
+                    tokens.append(0)
+                else:
+                    # Larger token request
+                    generated = np.random.lognormal(6.0, 1.3)  # exp(6.0) ≈ 403 tokens avg
+                    generated = min(generated, 2500)
+                    allocated = min(generated, remaining_tokens // max(1, num_requests - i - 1))
+                    tokens.append(max(0, allocated))
+                    remaining_tokens -= allocated
+
+        else:
+            # Low concurrency (like 2-4 requests/min with avg=450-935 tokens)
+            # Very few zero-token requests, large token sizes
+            zero_token_ratio = 0.01  # 1% zero-token requests
+
+            for i in range(num_requests):
+                if i == num_requests - 1:
+                    tokens.append(max(0, remaining_tokens))
+                elif np.random.random() < zero_token_ratio and remaining_tokens > 100:
+                    tokens.append(0)
+                else:
+                    # Large token request
+                    generated = np.random.lognormal(6.5, 1.2)  # exp(6.5) ≈ 665 tokens avg
+                    generated = min(generated, 3500)
+                    allocated = min(generated, remaining_tokens // max(1, num_requests - i - 1))
+                    tokens.append(max(0, allocated))
+                    remaining_tokens -= allocated
+
+        # Ensure we exactly match the total by adjusting the last few requests
+        token_sum = sum(tokens)
+        if token_sum != total_tokens and len(tokens) > 1:
+            diff = total_tokens - token_sum
+            i = len(tokens) - 1
+            while diff != 0 and i >= 0:
+                adjustment = 1 if diff > 0 else -1
+                new_val = max(0, tokens[i] + adjustment)
+                actual_adjustment = new_val - tokens[i]
+                tokens[i] = new_val
+                diff -= actual_adjustment
+                i -= 1
+
+        return tokens
+
+    def _normalize_original_burstgpt_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Normalize original BurstGPT data to standard format."""
+        normalized = pd.DataFrame()
+
         # Map BurstGPT columns to standard format
         normalized['input_toks'] = data['Request tokens'].astype(int)
         normalized['output_toks'] = data['Response tokens'].astype(int)
@@ -121,6 +329,24 @@ class UniversalDataLoader:
 
         # Detect burst patterns
         normalized['burst_pattern'] = self._detect_burst_pattern(normalized['arrival_time_ns'])
+
+        return normalized
+
+    def _generate_minimal_requests(self, num_requests: int) -> pd.DataFrame:
+        """Generate minimal requests when no activity data is available."""
+        requests = []
+        base_interval_ns = 60_000_000_000  # 1 minute in nanoseconds
+
+        for i in range(min(num_requests, 10)):  # Generate at most 10 requests
+            requests.append({
+                'input_toks': 128,  # Default input length
+                'output_toks': 256,  # Default output length
+                'arrival_time_ns': i * base_interval_ns,
+                'model_type': 'meta-llama/Llama-3.1-8B-Instruct'
+            })
+
+        normalized = pd.DataFrame(requests)
+        normalized['burst_pattern'] = 'steady'
 
         return normalized
 

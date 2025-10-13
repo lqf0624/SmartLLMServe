@@ -63,13 +63,20 @@ class PredictorTrainer:
             'loss_function': 'MSE'
         }
 
+        # 设置wandb目录为项目根目录
+        import os
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # 直接使用项目根目录作为wandb目录，避免嵌套
+        wandb_dir = project_root
+
         self.wandb_run = wandb.init(
             project=self.config.get('wandb_project', 'smartllm-serve'),
             entity=self.config.get('wandb_entity', None),
             name=self.config.get('wandb_run_name', f'predictor_{datetime.now().strftime("%Y%m%d_%H%M%S")}'),
             config=wandb_config,
             tags=['predictor', 'burstgpt', 'channel-independent'],
-            reinit=True
+            reinit=True,
+            dir=wandb_dir  # 指定wandb目录为项目根目录
         )
 
     def load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -122,8 +129,8 @@ class PredictorTrainer:
             'device': str(self.device)
         }
 
-        # 创建模型 - 通道独立版本使用标准MSE损失
-        model = DLinearPredictor(**model_config)
+        # 创建模型 - 使用改进的损失函数
+        model = DLinearPredictor(**model_config, loss_weights=self.config.get('loss_weights'))
 
         logger.info(f"模型创建完成，参数数量: {sum(p.numel() for p in model.model.parameters()):,}")
         logger.info(f"模型配置: individual={model_config['individual']}, channels={model_config['channels']}")
@@ -486,7 +493,7 @@ class PredictorTrainer:
         except Exception as e:
             logger.warning(f"Failed to create time series plot: {e}")
 
-    def _create_detailed_time_series_plot(self, prediction_comparison: Dict, val_data: pd.DataFrame, seq_len: int = 50):
+    def _create_detailed_time_series_plot(self, prediction_comparison: Dict, val_data: pd.DataFrame, seq_len: int = None):
         """创建详细的时间序列对比图，显示历史数据序列和未来预测"""
         try:
             import matplotlib.pyplot as plt
@@ -959,8 +966,19 @@ class PredictorTrainer:
         try:
             import matplotlib.pyplot as plt
 
+            # 注意：predictions和actuals的格式是 [pred_len*3]，按特征交错排列
+            # 即 [concurrent_t1, concurrent_t2, ..., input_t1, input_t2, ..., output_t1, output_t2, ...]
+            pred_len = len(predictions[0]) // 3  # 计算预测长度
+
             # 根据并发请求数将样本分为不同负载级别
-            concurrent_requests = actuals[:, 0]
+            # 需要从交错数据中提取concurrent_requests的平均值
+            concurrent_requests = []
+            for sample_idx in range(len(actuals)):
+                # 提取concurrent_requests的所有时间步数据并计算平均值
+                concurrent_data = actuals[sample_idx, 0:pred_len]
+                concurrent_avg = np.mean(concurrent_data)
+                concurrent_requests.append(concurrent_avg)
+            concurrent_requests = np.array(concurrent_requests)
 
             # 定义负载级别
             low_load = concurrent_requests <= 10
@@ -978,22 +996,33 @@ class PredictorTrainer:
             for feature_idx, feature_name in enumerate(['concurrent_requests', 'input_tokens', 'output_tokens']):
                 ax = axes[feature_idx]
 
+                # 计算该特征在数组中的起始和结束索引
+                start_idx = feature_idx * pred_len
+                end_idx = (feature_idx + 1) * pred_len
+
                 for level_name, mask, color in load_levels:
                     if np.any(mask):
-                        actual_vals = actuals[mask, feature_idx]
-                        pred_vals = predictions[mask, feature_idx]
+                        # 提取该特征所有时间步的数据并计算平均值
+                        actual_vals = actuals[mask, start_idx:end_idx]
+                        pred_vals = predictions[mask, start_idx:end_idx]
 
-                        # 计算该级别的R²
-                        ss_res = np.sum((actual_vals - pred_vals) ** 2)
-                        ss_tot = np.sum((actual_vals - np.mean(actual_vals)) ** 2)
+                        # 展平所有样本和时间步的数据
+                        actual_flat = actual_vals.flatten()
+                        pred_flat = pred_vals.flatten()
+
+                        # 计算该级别的R² - 使用展平的数据
+                        ss_res = np.sum((actual_flat - pred_flat) ** 2)
+                        ss_tot = np.sum((actual_flat - np.mean(actual_flat)) ** 2)
                         r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
 
-                        ax.scatter(actual_vals, pred_vals, alpha=0.6, s=40,
+                        ax.scatter(actual_flat, pred_flat, alpha=0.6, s=40,
                                  color=color, label=f'{level_name} (R²={r2:.3f})')
 
-                # 绘制完美预测线
-                min_val = np.min(actuals[:, feature_idx])
-                max_val = np.max(actuals[:, feature_idx])
+                # 绘制完美预测线 - 使用该特征的所有数据
+                feature_actuals = actuals[:, start_idx:end_idx].flatten()
+                feature_predictions = predictions[:, start_idx:end_idx].flatten()
+                min_val = min(np.min(feature_actuals), np.min(feature_predictions))
+                max_val = max(np.max(feature_actuals), np.max(feature_predictions))
                 ax.plot([min_val, max_val], [min_val, max_val], 'k--',
                        linewidth=2, label='Perfect Prediction', alpha=0.8)
 
@@ -1247,7 +1276,15 @@ class PredictorTrainer:
         logger.info(f"配置保存到: {config_path}")
 
         if self.wandb_run:
-            wandb.save(str(config_path))
+            try:
+                # 使用相对路径避免wandb路径问题
+                import os
+                original_cwd = os.getcwd()
+                os.chdir(self.output_dir.parent)
+                wandb.save('training_config.json')
+                os.chdir(original_cwd)
+            except Exception as e:
+                logger.warning(f"wandb保存配置失败: {e}")
 
     def cleanup(self):
         """清理资源"""
@@ -1262,13 +1299,13 @@ def load_default_config() -> Dict:
         'model_type': 'DLinear',
         'sequence_length': 50,
         'prediction_horizon': 10,
-        'batch_size': 64,
-        'learning_rate': 0.001,
+        'batch_size': 32,
+        'learning_rate': 0.0005,
         'epochs': 100,
         'hidden_size': 64,
         'num_layers': 2,
         'dropout': 0.1,
-        'early_stopping_patience': 25,
+        'early_stopping_patience': 50,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'output_dir': './training_output',
         'use_wandb': True,
@@ -1276,11 +1313,11 @@ def load_default_config() -> Dict:
         'wandb_entity': None,
         'wandb_run_name': None,
         'loss_weights': {
-            'time_weight': 1.0,
-            'input_token_weight': 0.5,
-            'output_token_weight': 0.5,
-            'time_loss_type': 'mse',
-            'token_loss_type': 'mse',
+            'time_weight': 2.0,
+            'input_token_weight': 1.0,
+            'output_token_weight': 1.0,
+            'time_loss_type': 'huber',
+            'token_loss_type': 'huber',
             'normalize_weights': True
         }
     }
@@ -1303,10 +1340,16 @@ def parse_args():
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
 
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=64, help='批大小')
-    parser.add_argument('--learning_rate', type=float, default=0.001, help='学习率')
+    parser.add_argument('--batch_size', type=int, default=32, help='批大小')
+    parser.add_argument('--learning_rate', type=float, default=0.0005, help='学习率')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
-    parser.add_argument('--early_stopping_patience', type=int, default=25, help='早停耐心值')
+    parser.add_argument('--early_stopping_patience', type=int, default=50, help='早停耐心值')
+
+    # 损失函数参数
+    parser.add_argument('--time_weight', type=float, default=2.0, help='时间间隔损失权重')
+    parser.add_argument('--input_token_weight', type=float, default=1.0, help='输入token损失权重')
+    parser.add_argument('--output_token_weight', type=float, default=1.0, help='输出token损失权重')
+    parser.add_argument('--loss_type', type=str, default='huber', choices=['mse', 'mae', 'huber'], help='损失函数类型')
 
     # 设备参数
     parser.add_argument('--device', type=str, default='auto', help='设备 (auto/cpu/cuda)')
@@ -1351,7 +1394,16 @@ def main():
         'use_wandb': args.use_wandb,
         'wandb_project': args.wandb_project,
         'wandb_entity': args.wandb_entity,
-        'wandb_run_name': args.wandb_run_name
+        'wandb_run_name': args.wandb_run_name,
+        # 更新损失函数权重
+        'loss_weights': {
+            'time_weight': args.time_weight,
+            'input_token_weight': args.input_token_weight,
+            'output_token_weight': args.output_token_weight,
+            'time_loss_type': args.loss_type,
+            'token_loss_type': args.loss_type,
+            'normalize_weights': True
+        }
     })
 
     # 设置设备

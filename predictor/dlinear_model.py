@@ -103,13 +103,27 @@ class DLinearPredictor:
     """DLinear预测器 - 简化版本"""
 
     def __init__(self, seq_len=120, pred_len=3, channels=3, individual=True,
-                 learning_rate=0.001, device='auto', kernel_size=25):
+                 learning_rate=0.001, device='auto', kernel_size=25,
+                 loss_weights=None):
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.channels = channels
         self.individual = individual
         self.learning_rate = learning_rate
         self.kernel_size = kernel_size
+
+        # 设置损失函数权重
+        if loss_weights is None:
+            self.loss_weights = {
+                'time_weight': 1.0,
+                'input_token_weight': 0.5,
+                'output_token_weight': 0.5,
+                'time_loss_type': 'mse',
+                'token_loss_type': 'mse',
+                'normalize_weights': True
+            }
+        else:
+            self.loss_weights = loss_weights
 
         # 设置设备
         if device == 'auto':
@@ -120,16 +134,16 @@ class DLinearPredictor:
         # 创建模型
         self.model = self._create_model().to(self.device)
 
-        # 使用AdamW优化器
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=0.01)
+        # 使用AdamW优化器，降低权重衰减
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
 
-        # 学习率调度器
+        # 改进的学习率调度器
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=5
+            self.optimizer, mode='min', factor=0.8, patience=15, min_lr=1e-7
         )
 
-        # 损失函数
-        self.criterion = nn.MSELoss()
+        # 创建损失函数
+        self.criterion = self._create_loss_function()
 
         # 标准化器
         self.scalers = None
@@ -178,6 +192,59 @@ class DLinearPredictor:
                 return out  # [batch_size, channels, pred_len]
 
         return DLinear(self.seq_len, self.pred_len, self.channels, self.individual)
+
+    def _create_loss_function(self):
+        """创建带权重的损失函数"""
+        class WeightedLoss(nn.Module):
+            def __init__(self, weights):
+                super().__init__()
+                self.time_weight = weights.get('time_weight', 1.0)
+                self.input_token_weight = weights.get('input_token_weight', 0.5)
+                self.output_token_weight = weights.get('output_token_weight', 0.5)
+                self.time_loss_type = weights.get('time_loss_type', 'mse')
+                self.token_loss_type = weights.get('token_loss_type', 'mse')
+
+                # 创建基础损失函数
+                if self.time_loss_type == 'huber':
+                    self.time_criterion = nn.HuberLoss(delta=1.0)
+                elif self.time_loss_type == 'mae':
+                    self.time_criterion = nn.L1Loss()
+                else:
+                    self.time_criterion = nn.MSELoss()
+
+                if self.token_loss_type == 'huber':
+                    self.token_criterion = nn.HuberLoss(delta=1.0)
+                elif self.token_loss_type == 'mae':
+                    self.token_criterion = nn.L1Loss()
+                else:
+                    self.token_criterion = nn.MSELoss()
+
+            def forward(self, predictions, targets):
+                # predictions: [batch_size, channels, pred_len]
+                # targets: [batch_size, channels, pred_len]
+
+                # 分离各个特征
+                pred_time = predictions[:, 0, :]  # [batch_size, pred_len]
+                pred_input_tokens = predictions[:, 1, :]  # [batch_size, pred_len]
+                pred_output_tokens = predictions[:, 2, :]  # [batch_size, pred_len]
+
+                target_time = targets[:, 0, :]  # [batch_size, pred_len]
+                target_input_tokens = targets[:, 1, :]  # [batch_size, pred_len]
+                target_output_tokens = targets[:, 2, :]  # [batch_size, pred_len]
+
+                # 计算各特征的损失
+                time_loss = self.time_criterion(pred_time, target_time)
+                input_token_loss = self.token_criterion(pred_input_tokens, target_input_tokens)
+                output_token_loss = self.token_criterion(pred_output_tokens, target_output_tokens)
+
+                # 加权求和
+                total_loss = (self.time_weight * time_loss +
+                             self.input_token_weight * input_token_loss +
+                             self.output_token_weight * output_token_loss)
+
+                return total_loss
+
+        return WeightedLoss(self.loss_weights)
 
     def prepare_data(self, data: pd.DataFrame):
         """准备数据"""
@@ -541,8 +608,8 @@ class DLinearPredictor:
 
         # 计算预测期间的平均值用于日志输出
         mean_prediction = prediction.mean(axis=1)  # [channels]
-        logger.info(f"预测结果: 并发请求={mean_prediction[0]:.1f}, "
-                   f"输入token={mean_prediction[1]:.1f}, 输出token={mean_prediction[2]:.1f}")
+        #logger.info(f"预测结果: 并发请求={mean_prediction[0]:.1f}, "
+                   #f"输入token={mean_prediction[1]:.1f}, 输出token={mean_prediction[2]:.1f}")
 
         # 如果指定了steps且小于pred_len，只返回前steps个预测
         if steps is not None and steps < self.pred_len:
